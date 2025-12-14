@@ -291,6 +291,10 @@ int64_t forward(const int8_t* weights, const uint8_t* nonce) {
 // Weight Generation from Challenge String (SHA-256 based)
 // ============================================================================
 
+// Weights are derived from a global epoch identifier, not per-user.
+// This ensures all miners compute the same neural network, enabling fair difficulty comparison.
+constexpr const char* WEIGHT_EPOCH = "epoch0";
+
 namespace sha256 {
 
 static const uint32_t K[64] = {
@@ -927,8 +931,8 @@ int main(int argc, char* argv[]) {
     }
     std::cout << ")" << std::endl;
 
-    std::cout << "Generating network weights..." << std::endl;
-    generate_weights(shared.username, shared.weights);
+    std::cout << "Generating network weights from epoch: " << WEIGHT_EPOCH << std::endl;
+    generate_weights(WEIGHT_EPOCH, shared.weights);
     std::cout << "Generated " << shared.weights.size() << " weight bytes" << std::endl;
 
     std::cout << "Network: " << INPUT_DIM << " -> " << HIDDEN_DIM << " -> " << HIDDEN_DIM << " -> " << HIDDEN_DIM << " -> " << OUTPUT_DIM << std::endl;

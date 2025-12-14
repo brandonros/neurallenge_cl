@@ -1,6 +1,6 @@
 # neurallenge
 
-GPU proof-of-work using FP32 neural network inference instead of SHA-256.
+GPU proof-of-work using FP32 neural network inference.
 
 ## How it works
 
