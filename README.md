@@ -4,13 +4,14 @@ GPU proof-of-work using FP32 neural network inference.
 
 ## How it works
 
-1. Global epoch string ("epoch0") → SHA-256 → deterministic int8 weights (~148KB)
-2. Random 64-byte nonce → network input (32 floats)
-3. Forward pass: 32 → 256 → 256 → 256 → 32 MLP with ReLU
-4. Output → SipHash-2-4 → 32-byte digest
-5. Count leading zero bits in digest (more = better)
+1. **Epoch string (`epoch0`) → SHA-256 → deterministic int8 weights (~148KB)**
+   Everyone mines the same neural network for a fair leaderboard.
 
-All FP32 ops are quantized to Q16.16 fixed-point grid for cross-platform determinism.
+2. **Random 64-byte nonce → 32 Q16 floats → forward pass → 32 Q16 outputs**
+   MLP with ReLU: 32→256→256→256→32. All math snapped to Q16 grid for CPU/GPU determinism.
+
+3. **Output → SipHash-2-4 → 32-byte digest → count leading zero bits**
+   More zeros = better proof. Proof format: `username/nonce`.
 
 ## vs Shallenge
 

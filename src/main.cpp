@@ -23,6 +23,7 @@
 #include <iomanip>
 #include <iostream>
 #include <mutex>
+#include <random>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -373,12 +374,6 @@ void append_u32(std::vector<uint8_t>& data, uint32_t value) {
     }
 }
 
-void append_u64(std::vector<uint8_t>& data, uint64_t value) {
-    for (int i = 0; i < 8; i++) {
-        data.push_back(static_cast<uint8_t>((value >> (i * 8)) & 0xFF));
-    }
-}
-
 void generate_weights(const std::string& challenge, std::vector<int8_t>& weights) {
     weights.resize(TOTAL_WEIGHTS);
 
@@ -402,24 +397,6 @@ void generate_weights(const std::string& challenge, std::vector<int8_t>& weights
     }
 }
 
-void derive_launch_seeds(const std::string& instance, int device_index, uint64_t launch_id,
-                         uint32_t& seed_lo, uint32_t& seed_hi) {
-    std::vector<uint8_t> material(instance.begin(), instance.end());
-    append_u32(material, static_cast<uint32_t>(device_index));
-    append_u64(material, launch_id);
-
-    uint8_t hash_out[32];
-    sha256::hash(material.data(), material.size(), hash_out);
-
-    seed_lo = static_cast<uint32_t>(hash_out[0]) |
-              (static_cast<uint32_t>(hash_out[1]) << 8) |
-              (static_cast<uint32_t>(hash_out[2]) << 16) |
-              (static_cast<uint32_t>(hash_out[3]) << 24);
-    seed_hi = static_cast<uint32_t>(hash_out[4]) |
-              (static_cast<uint32_t>(hash_out[5]) << 8) |
-              (static_cast<uint32_t>(hash_out[6]) << 16) |
-              (static_cast<uint32_t>(hash_out[7]) << 24);
-}
 
 // ============================================================================
 // Shared State
@@ -619,6 +596,10 @@ bool create_gpu_context(cl_device_id device, int device_index, const SharedState
 void gpu_worker_thread(GPUContext& ctx, SharedState& shared) {
     std::cout << "[GPU " << ctx.device_index << "] Started mining on " << ctx.device_name << std::endl;
 
+    // Thread-local RNG for generating kernel seeds
+    std::random_device rd;
+    std::mt19937 rng(rd());
+
     while (shared.running.load()) {
         cl_long target_score;
         {
@@ -626,12 +607,9 @@ void gpu_worker_thread(GPUContext& ctx, SharedState& shared) {
             target_score = shared.best_score;
         }
 
-        uint64_t launch_id = ctx.launch_counter.fetch_add(1);
-        uint32_t seed_lo_host = 0;
-        uint32_t seed_hi_host = 0;
-        derive_launch_seeds(shared.username, ctx.device_index, launch_id, seed_lo_host, seed_hi_host);
-        cl_uint seed_lo = static_cast<cl_uint>(seed_lo_host);
-        cl_uint seed_hi = static_cast<cl_uint>(seed_hi_host);
+        ctx.launch_counter.fetch_add(1);
+        cl_uint seed_lo = rng();
+        cl_uint seed_hi = rng();
 
         cl_uint zero = 0;
         clEnqueueWriteBuffer(ctx.queue, ctx.found_count_buf, CL_FALSE, 0, sizeof(cl_uint), &zero, 0, nullptr, nullptr);
