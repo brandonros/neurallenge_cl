@@ -47,7 +47,9 @@ Options:
 ## Verifying a proof
 
 ```bash
-./output/neurallenge --verify "brandonros/1807944a1b9bb9d33b349f179a776784feae5a1ee7ae7fddbc0832ff733c53a0b7b3271d8ad34d63d241308cd22b9ace361f5245f88ccf76262cee7745924416"
+./output/neurallenge --verify "brandonros/GAehbrFwu9v3s5u2b4n0L8C8m7E2g7B3x5C4D6F7H8J9K0M1N2P3Q4R5S6T7U8V9W0=="
 ```
 
 Output shows the digest and leading zero bits.
+
+Nonces are base64-encoded (86 characters for 64 bytes).

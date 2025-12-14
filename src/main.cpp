@@ -447,13 +447,63 @@ std::string describe_lz_bits(int bits) {
     return std::to_string(bits) + " bits";
 }
 
-bool hex_to_bytes(const std::string& hex, std::vector<uint8_t>& out) {
-    if (hex.size() % 2 != 0) return false;
-    out.resize(hex.size() / 2);
-    for (size_t i = 0; i < out.size(); i++) {
-        unsigned int byte;
-        if (std::sscanf(hex.c_str() + i * 2, "%2x", &byte) != 1) return false;
-        out[i] = static_cast<uint8_t>(byte);
+// Base64 encoding table
+static const char BASE64_CHARS[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+std::string bytes_to_base64(const uint8_t* data, size_t len) {
+    std::string result;
+    result.reserve((len + 2) / 3 * 4);
+
+    for (size_t i = 0; i < len; i += 3) {
+        uint32_t n = static_cast<uint32_t>(data[i]) << 16;
+        if (i + 1 < len) n |= static_cast<uint32_t>(data[i + 1]) << 8;
+        if (i + 2 < len) n |= static_cast<uint32_t>(data[i + 2]);
+
+        result += BASE64_CHARS[(n >> 18) & 0x3F];
+        result += BASE64_CHARS[(n >> 12) & 0x3F];
+        result += (i + 1 < len) ? BASE64_CHARS[(n >> 6) & 0x3F] : '=';
+        result += (i + 2 < len) ? BASE64_CHARS[n & 0x3F] : '=';
+    }
+    return result;
+}
+
+bool base64_to_bytes(const std::string& b64, std::vector<uint8_t>& out) {
+    // Build reverse lookup table
+    static int8_t decode_table[256] = {-1};
+    static bool table_init = false;
+    if (!table_init) {
+        std::memset(decode_table, -1, sizeof(decode_table));
+        for (int i = 0; i < 64; i++) {
+            decode_table[static_cast<uint8_t>(BASE64_CHARS[i])] = static_cast<int8_t>(i);
+        }
+        table_init = true;
+    }
+
+    if (b64.size() % 4 != 0) return false;
+
+    size_t padding = 0;
+    if (!b64.empty() && b64[b64.size() - 1] == '=') padding++;
+    if (b64.size() > 1 && b64[b64.size() - 2] == '=') padding++;
+
+    out.resize((b64.size() / 4) * 3 - padding);
+
+    size_t j = 0;
+    for (size_t i = 0; i < b64.size(); i += 4) {
+        int8_t a = decode_table[static_cast<uint8_t>(b64[i])];
+        int8_t b = decode_table[static_cast<uint8_t>(b64[i + 1])];
+        int8_t c = (b64[i + 2] == '=') ? 0 : decode_table[static_cast<uint8_t>(b64[i + 2])];
+        int8_t d = (b64[i + 3] == '=') ? 0 : decode_table[static_cast<uint8_t>(b64[i + 3])];
+
+        if (a < 0 || b < 0 || (b64[i + 2] != '=' && c < 0) || (b64[i + 3] != '=' && d < 0)) {
+            return false;
+        }
+
+        uint32_t n = (static_cast<uint32_t>(a) << 18) | (static_cast<uint32_t>(b) << 12) |
+                     (static_cast<uint32_t>(c) << 6) | static_cast<uint32_t>(d);
+
+        if (j < out.size()) out[j++] = static_cast<uint8_t>((n >> 16) & 0xFF);
+        if (j < out.size()) out[j++] = static_cast<uint8_t>((n >> 8) & 0xFF);
+        if (j < out.size()) out[j++] = static_cast<uint8_t>(n & 0xFF);
     }
     return true;
 }
@@ -666,7 +716,7 @@ void gpu_worker_thread(GPUContext& ctx, SharedState& shared) {
                     cpu_verifier::compute_digest(outputs, digest, OUTPUT_DIM);
                     int lz_bits = cpu_verifier::count_leading_zero_bits(digest, DIGEST_BYTES);
                     std::string digest_hex = bytes_to_hex(digest, DIGEST_BYTES);
-                    std::string nonce_hex = bytes_to_hex(batch_best_nonce, NONCE_BYTES);
+                    std::string nonce_b64 = bytes_to_base64(batch_best_nonce, NONCE_BYTES);
 
                     shared.best_score = cpu_score;
                     shared.best_nonce.assign(batch_best_nonce, batch_best_nonce + NONCE_BYTES);
@@ -679,7 +729,7 @@ void gpu_worker_thread(GPUContext& ctx, SharedState& shared) {
                     std::cout << "\n[GPU " << ctx.device_index << "] NEW BEST: "
                               << describe_lz_bits(lz_bits) << " | digest="
                               << format_digest_with_marker(digest_hex, lz_bits) << std::endl;
-                    std::cout << "  Proof: " << shared.username << "/" << nonce_hex << std::endl;
+                    std::cout << "  Proof: " << shared.username << "/" << nonce_b64 << std::endl;
                     if (shared.verbose) {
                         std::cout << "  Output: [";
                         for (size_t i = 0; i < OUTPUT_DIM; i++) {
@@ -876,19 +926,19 @@ int main(int argc, char* argv[]) {
 
     // Verify mode: parse proof, verify, and exit
     if (!verify_proof.empty()) {
-        // Parse proof: username/nonce_hex
+        // Parse proof: username/nonce_base64
         size_t slash_pos = verify_proof.find('/');
         if (slash_pos == std::string::npos) {
-            std::cerr << "Invalid proof format. Expected: username/nonce_hex" << std::endl;
+            std::cerr << "Invalid proof format. Expected: username/nonce_base64" << std::endl;
             return 1;
         }
         std::string proof_username = verify_proof.substr(0, slash_pos);
-        std::string nonce_hex = verify_proof.substr(slash_pos + 1);
+        std::string nonce_b64 = verify_proof.substr(slash_pos + 1);
 
         std::vector<uint8_t> nonce;
-        if (!hex_to_bytes(nonce_hex, nonce) || nonce.size() != NONCE_BYTES) {
-            std::cerr << "Invalid nonce: expected " << NONCE_BYTES << " bytes ("
-                      << (NONCE_BYTES * 2) << " hex chars), got " << nonce.size() << std::endl;
+        if (!base64_to_bytes(nonce_b64, nonce) || nonce.size() != NONCE_BYTES) {
+            std::cerr << "Invalid nonce: expected " << NONCE_BYTES << " bytes (base64), got "
+                      << nonce.size() << std::endl;
             return 1;
         }
 
@@ -907,7 +957,7 @@ int main(int argc, char* argv[]) {
         std::cout << "Proof Verification" << std::endl;
         std::cout << "==================" << std::endl;
         std::cout << "Username: " << proof_username << std::endl;
-        std::cout << "Nonce: " << nonce_hex << std::endl;
+        std::cout << "Nonce: " << nonce_b64 << std::endl;
         std::cout << "Digest: " << format_digest_with_marker(digest_hex, lz_bits) << std::endl;
         std::cout << "Result: " << describe_lz_bits(lz_bits) << std::endl;
         return 0;
@@ -1051,11 +1101,11 @@ int main(int argc, char* argv[]) {
         cpu_verifier::compute_digest(outputs, digest, OUTPUT_DIM);
         int lz_bits = cpu_verifier::count_leading_zero_bits(digest, DIGEST_BYTES);
         std::string digest_hex = bytes_to_hex(digest, DIGEST_BYTES);
-        std::string nonce_hex = bytes_to_hex(shared.best_nonce.data(), NONCE_BYTES);
+        std::string nonce_b64 = bytes_to_base64(shared.best_nonce.data(), NONCE_BYTES);
 
         std::cout << "\nBest Result: " << describe_lz_bits(lz_bits) << std::endl;
         std::cout << "Digest: " << format_digest_with_marker(digest_hex, lz_bits) << std::endl;
-        std::cout << "Proof: " << shared.username << "/" << nonce_hex << std::endl;
+        std::cout << "Proof: " << shared.username << "/" << nonce_b64 << std::endl;
         if (shared.verbose) {
             std::cout << "Output: [";
             for (size_t i = 0; i < OUTPUT_DIM; i++) {
