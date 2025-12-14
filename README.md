@@ -4,7 +4,7 @@ GPU proof-of-work using FP32 neural network inference instead of SHA-256.
 
 ## How it works
 
-1. Challenge string → SHA-256 → deterministic int8 weights (~148KB)
+1. Username → SHA-256 → deterministic int8 weights (~148KB)
 2. Random 64-byte nonce → network input (32 floats)
 3. Forward pass: 32 → 256 → 256 → 256 → 32 MLP with ReLU
 4. Output → SipHash-2-4 → 32-byte digest
@@ -25,18 +25,25 @@ All FP32 ops are quantized to Q16.16 fixed-point grid for cross-platform determi
 
 ```bash
 make
-./output/neurallenge --challenge "test" --bits 24
+./output/neurallenge brandonros --bits 24
 ```
 
 ## Usage
 
 ```
-./output/neurallenge [OPTIONS] [CHALLENGE] [BITS]
+./output/neurallenge [OPTIONS] [USERNAME] [BITS]
 
 Options:
-  -c, --challenge STRING   Challenge string (default: neural_pow_test/epoch0)
-  -u, --user STRING        Username for proof (default: from Makefile)
+  -u, --user STRING        Username (default: from Makefile)
   -b, --bits N             Target leading zero bits
   -x, --hex N              Target leading zero hex digits (N*4 bits)
   -v, --verbose            Show network outputs
 ```
+
+## Proof format
+
+```
+username/nonce → digest
+```
+
+Anyone can verify by deriving weights from the username, running the forward pass with the nonce, and counting leading zeros in the digest.

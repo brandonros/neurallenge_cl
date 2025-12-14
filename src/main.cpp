@@ -428,9 +428,7 @@ struct SharedState {
     std::vector<uint8_t> best_nonce;
     std::vector<uint8_t> best_digest;
     std::atomic<bool> running{true};
-    std::string challenge;
     std::string username;
-    std::string instance_id;
     bool verbose = false;
     std::vector<int8_t> weights;
     std::chrono::steady_clock::time_point start_time;
@@ -631,7 +629,7 @@ void gpu_worker_thread(GPUContext& ctx, SharedState& shared) {
         uint64_t launch_id = ctx.launch_counter.fetch_add(1);
         uint32_t seed_lo_host = 0;
         uint32_t seed_hi_host = 0;
-        derive_launch_seeds(shared.instance_id, ctx.device_index, launch_id, seed_lo_host, seed_hi_host);
+        derive_launch_seeds(shared.username, ctx.device_index, launch_id, seed_lo_host, seed_hi_host);
         cl_uint seed_lo = static_cast<cl_uint>(seed_lo_host);
         cl_uint seed_hi = static_cast<cl_uint>(seed_hi_host);
 
@@ -767,18 +765,17 @@ void setup_fp_environment() {
 // Golden Vector Test - Verify GPU/CPU determinism at startup
 // ============================================================================
 
-bool run_golden_vector_test(GPUContext& ctx, const SharedState& shared) {
-    // Known good nonce that produces 27 leading zero bits with default challenge
-    // Challenge: "neural_pow_test/epoch0:brandonros"
-    // Expected digest: 0000001772c85c985cd67e6904ae09666c2bdd8396161b63e91e8b05319e770d
-    static const uint8_t golden_nonce[NONCE_BYTES] = {
-        0x66, 0x74, 0x16, 0xa7, 0x75, 0x95, 0xa3, 0x2c, 0x55, 0xf6, 0x17, 0x31, 0xdc, 0x51, 0x20, 0x35,
-        0x0e, 0x4d, 0x6e, 0x80, 0x71, 0x60, 0x2c, 0x2c, 0xf8, 0xc8, 0xfb, 0x59, 0x56, 0x57, 0xe5, 0xd8,
-        0x88, 0xac, 0xbf, 0x14, 0x67, 0xe9, 0x23, 0x45, 0xac, 0x19, 0xe9, 0x0c, 0x65, 0xf8, 0x2f, 0x19,
-        0xe2, 0x26, 0x51, 0x20, 0x53, 0x60, 0xfc, 0xf6, 0xbc, 0xb4, 0x98, 0x85, 0x85, 0xc5, 0x79, 0xfe
-    };
+bool run_determinism_test(GPUContext& ctx, const SharedState& shared) {
+    // Generate a test nonce deterministically from the username
     uint8_t test_nonce[NONCE_BYTES];
-    memcpy(test_nonce, golden_nonce, NONCE_BYTES);
+    uint8_t hash_out[32];
+    std::string test_material = shared.username + ":test_nonce";
+    sha256::hash(reinterpret_cast<const uint8_t*>(test_material.data()),
+                 test_material.size(), hash_out);
+    // Fill nonce from hash (repeat if needed)
+    for (size_t i = 0; i < NONCE_BYTES; i++) {
+        test_nonce[i] = hash_out[i % 32];
+    }
 
     // CPU computation
     int64_t cpu_score = cpu_verifier::forward(shared.weights.data(), test_nonce);
@@ -788,11 +785,6 @@ bool run_golden_vector_test(GPUContext& ctx, const SharedState& shared) {
     cpu_verifier::compute_digest(cpu_outputs, digest, OUTPUT_DIM);
     int cpu_bits = cpu_verifier::count_leading_zero_bits(digest, DIGEST_BYTES);
 
-    // GPU computation - run single-item kernel with the test nonce
-    // We'll use a special approach: write the nonce directly and run with known seed
-    // For simplicity, just verify the CPU verifier is self-consistent here
-    // The main verification happens during mining when GPU results are checked
-
     // Self-consistency check: run CPU twice, must match
     int64_t cpu_score2 = cpu_verifier::forward(shared.weights.data(), test_nonce);
     if (cpu_score != cpu_score2) {
@@ -800,19 +792,6 @@ bool run_golden_vector_test(GPUContext& ctx, const SharedState& shared) {
         std::cerr << "  Run 1: " << cpu_score << std::endl;
         std::cerr << "  Run 2: " << cpu_score2 << std::endl;
         return false;
-    }
-
-    // Verify expected result with default challenge (golden vector validation)
-    if (shared.instance_id == "neural_pow_test/epoch0:brandonros") {
-        constexpr int EXPECTED_LZ_BITS = 27;
-        if (cpu_bits != EXPECTED_LZ_BITS) {
-            std::cerr << "FATAL: Golden vector mismatch!" << std::endl;
-            std::cerr << "  Expected: " << EXPECTED_LZ_BITS << " leading zero bits" << std::endl;
-            std::cerr << "  Got: " << cpu_bits << " leading zero bits" << std::endl;
-            std::cerr << "  This indicates a determinism bug in the verifier." << std::endl;
-            return false;
-        }
-        std::cout << "[Test] Golden vector PASSED (27 LZ bits verified)" << std::endl;
     }
 
     // Verify lrintf behaves correctly for edge cases
@@ -829,18 +808,10 @@ bool run_golden_vector_test(GPUContext& ctx, const SharedState& shared) {
         }
     }
 
-    int cpu_zeros = cpu_verifier::score_to_leading_zero_bits(cpu_score);
     std::string digest_hex = digest_to_hex(digest, DIGEST_BYTES);
-    std::cout << "[Test] Golden vector: CPU score=" << cpu_score
-              << " (" << describe_lz_bits(cpu_zeros) << ")" << std::endl;
-    std::cout << "[Test] Digest: " << format_digest_with_marker(digest_hex, cpu_bits)
-              << " (LZ=" << describe_lz_bits(cpu_bits) << ")" << std::endl;
-    std::cout << "[Test] CPU outputs: [";
-    for (size_t i = 0; i < OUTPUT_DIM; i++) {
-        std::cout << std::fixed << std::setprecision(4) << cpu_outputs[i];
-        if (i < OUTPUT_DIM - 1) std::cout << ", ";
-    }
-    std::cout << "]" << std::endl;
+    std::cout << "[Test] CPU determinism check PASSED" << std::endl;
+    std::cout << "[Test] Test nonce digest: " << format_digest_with_marker(digest_hex, cpu_bits)
+              << " (" << cpu_bits << " LZ bits)" << std::endl;
 
     return true;
 }
@@ -853,7 +824,6 @@ int main(int argc, char* argv[]) {
     // Setup FP environment (rounding mode, FTZ/DAZ)
     setup_fp_environment();
 
-    std::string challenge = "neural_pow_test/epoch0";
     std::string username = DEFAULT_USERNAME;
     int target_zero_bits = 16;
     bool verbose = false;
@@ -882,15 +852,6 @@ int main(int argc, char* argv[]) {
             }
             return std::string(argv[++i]);
         };
-
-        if (arg == "--challenge" || arg == "-c") {
-            challenge = require_value(arg);
-            continue;
-        }
-        if (arg.rfind("--challenge=", 0) == 0) {
-            challenge = arg.substr(std::string("--challenge=").size());
-            continue;
-        }
 
         if (arg == "--user" || arg == "-u") {
             username = require_value(arg);
@@ -932,7 +893,7 @@ int main(int argc, char* argv[]) {
     }
 
     if (!positional.empty()) {
-        challenge = positional[0];
+        username = positional[0];
     }
     if (positional.size() > 1) {
         parse_bits_value(positional[1], 1);
@@ -941,9 +902,7 @@ int main(int argc, char* argv[]) {
     int64_t initial_target = -(static_cast<int64_t>(base_bits) << SCORE_SHIFT);
 
     SharedState shared;
-    shared.challenge = challenge;
     shared.username = username;
-    shared.instance_id = challenge + ":" + username;
     shared.verbose = verbose;
     shared.best_score = initial_target;
     shared.start_time = std::chrono::steady_clock::now();
@@ -951,10 +910,8 @@ int main(int argc, char* argv[]) {
     int target_hex_digits = target_zero_bits / 4;
     int target_hex_extra_bits = target_zero_bits % 4;
 
-    std::cout << "Neural Proof-of-Work Miner v2 (OpenCL)" << std::endl;
-    std::cout << "Challenge: " << challenge << std::endl;
-    std::cout << "User: " << shared.username << std::endl;
-    std::cout << "Instance: " << shared.instance_id << std::endl;
+    std::cout << "Neural Proof-of-Work Miner (OpenCL)" << std::endl;
+    std::cout << "Username: " << shared.username << std::endl;
     std::cout << "Target: " << target_zero_bits << "+ leading zero bits ("
               << target_hex_digits << " hex digit" << (target_hex_digits == 1 ? "" : "s");
     if (target_hex_extra_bits) {
@@ -963,7 +920,7 @@ int main(int argc, char* argv[]) {
     std::cout << ")" << std::endl;
 
     std::cout << "Generating network weights..." << std::endl;
-    generate_weights(shared.instance_id, shared.weights);
+    generate_weights(shared.username, shared.weights);
     std::cout << "Generated " << shared.weights.size() << " weight bytes" << std::endl;
 
     std::cout << "Network: " << INPUT_DIM << " -> " << HIDDEN_DIM << " -> " << HIDDEN_DIM << " -> " << HIDDEN_DIM << " -> " << OUTPUT_DIM << std::endl;
@@ -989,9 +946,9 @@ int main(int argc, char* argv[]) {
         std::cout << "Initialized GPU " << i << ": " << gpus[i].device_name << std::endl;
     }
 
-    // Run golden vector test to verify determinism
-    if (!run_golden_vector_test(gpus[0], shared)) {
-        std::cerr << "Golden vector test failed! Aborting." << std::endl;
+    // Run determinism test to verify CPU consistency
+    if (!run_determinism_test(gpus[0], shared)) {
+        std::cerr << "Determinism test failed! Aborting." << std::endl;
         return 1;
     }
 
@@ -1061,8 +1018,7 @@ int main(int argc, char* argv[]) {
     std::cout << "\n\n========================================" << std::endl;
     std::cout << "Final Results" << std::endl;
     std::cout << "========================================" << std::endl;
-    std::cout << "Challenge: " << shared.challenge << std::endl;
-    std::cout << "User: " << shared.username << std::endl;
+    std::cout << "Username: " << shared.username << std::endl;
 
     if (!shared.best_nonce.empty()) {
         float outputs[OUTPUT_DIM];
