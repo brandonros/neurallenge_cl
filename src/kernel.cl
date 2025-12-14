@@ -229,6 +229,15 @@ inline void nonce_to_input(const uchar* nonce, uint nonce_len, float* input) {
 
 #define ROTL32(x, k) (((x) << (k)) | ((x) >> (32 - (k))))
 
+// Base64 character set for nonce generation
+__constant uchar BASE64_CHARS[64] = {
+    'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M',
+    'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z',
+    'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm',
+    'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z',
+    '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '+', '/'
+};
+
 inline uint splitmix32(uint x) {
     x += 0x9e3779b9u;
     x = (x ^ (x >> 16)) * 0x85ebca6bu;
@@ -250,14 +259,16 @@ inline uint xoroshiro64_next(uint* s0, uint* s1) {
     return result;
 }
 
+// Generate base64 characters directly (like Shallenge)
+// This ensures what's stored IS what's displayed - no encoding/decoding needed
 inline void generate_nonce(uint* s0, uint* s1, uchar* nonce) {
-    // Generate NONCE_BYTES using 32-bit RNG outputs (4 bytes each)
-    for (int i = 0; i < (NONCE_BYTES / 4); i++) {
-        uint r = xoroshiro64_next(s0, s1);
-        nonce[i*4 + 0] = (r >> 0) & 0xFF;
-        nonce[i*4 + 1] = (r >> 8) & 0xFF;
-        nonce[i*4 + 2] = (r >> 16) & 0xFF;
-        nonce[i*4 + 3] = (r >> 24) & 0xFF;
+    for (int i = 0; i < NONCE_BYTES; ) {
+        uint bits = xoroshiro64_next(s0, s1);
+        // Extract 5 base64 chars per 32-bit word (6 bits each, 30 bits used)
+        for (int j = 0; j < 5 && i < NONCE_BYTES; j++, i++) {
+            nonce[i] = BASE64_CHARS[bits & 63];
+            bits >>= 6;
+        }
     }
 }
 

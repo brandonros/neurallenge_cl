@@ -743,7 +743,7 @@ void gpu_worker_thread(GPUContext& ctx, SharedState& shared) {
                     cpu_verifier::compute_digest(outputs, digest, OUTPUT_DIM);
                     int lz_bits = cpu_verifier::count_leading_zero_bits(digest, DIGEST_BYTES);
                     std::string digest_hex = bytes_to_hex(digest, DIGEST_BYTES);
-                    std::string nonce_b64 = bytes_to_base64(batch_best_nonce, NONCE_BYTES);
+                    std::string nonce_str(reinterpret_cast<char*>(batch_best_nonce), NONCE_BYTES);
 
                     shared.best_score = cpu_score;
                     shared.best_nonce.assign(batch_best_nonce, batch_best_nonce + NONCE_BYTES);
@@ -756,7 +756,7 @@ void gpu_worker_thread(GPUContext& ctx, SharedState& shared) {
                     std::cout << "\n[GPU " << ctx.device_index << "] NEW BEST: "
                               << describe_lz_bits(lz_bits) << " | digest="
                               << format_digest_with_marker(digest_hex, lz_bits) << std::endl;
-                    std::cout << "  Proof: " << shared.username << "/" << nonce_b64 << std::endl;
+                    std::cout << "  Proof: " << shared.username << "/" << nonce_str << std::endl;
                     if (shared.verbose) {
                         std::cout << "  Output: [";
                         for (size_t i = 0; i < OUTPUT_DIM; i++) {
@@ -1129,11 +1129,11 @@ int main(int argc, char* argv[]) {
         cpu_verifier::compute_digest(outputs, digest, OUTPUT_DIM);
         int lz_bits = cpu_verifier::count_leading_zero_bits(digest, DIGEST_BYTES);
         std::string digest_hex = bytes_to_hex(digest, DIGEST_BYTES);
-        std::string nonce_b64 = bytes_to_base64(shared.best_nonce.data(), shared.best_nonce.size());
+        std::string nonce_str(reinterpret_cast<char*>(shared.best_nonce.data()), shared.best_nonce.size());
 
         std::cout << "\nBest Result: " << describe_lz_bits(lz_bits) << std::endl;
         std::cout << "Digest: " << format_digest_with_marker(digest_hex, lz_bits) << std::endl;
-        std::cout << "Proof: " << shared.username << "/" << nonce_b64 << std::endl;
+        std::cout << "Proof: " << shared.username << "/" << nonce_str << std::endl;
         if (shared.verbose) {
             std::cout << "Output: [";
             for (size_t i = 0; i < OUTPUT_DIM; i++) {
