@@ -38,7 +38,7 @@
 #define HAS_MXCSR 1
 #endif
 
-#include "neural_kernel.h"
+#include "neurallenge_kernel.h"
 
 // ============================================================================
 // Configuration
@@ -49,9 +49,9 @@
 
 constexpr size_t MAX_RESULTS = 64;
 
-// Network architecture
+// Network architecture: 32 -> 256 -> 256 -> 256 -> 32
 constexpr size_t INPUT_DIM = 32;
-constexpr size_t HIDDEN_DIM = 128;
+constexpr size_t HIDDEN_DIM = 256;
 constexpr size_t OUTPUT_DIM = 32;
 constexpr size_t DIGEST_BYTES = OUTPUT_DIM;
 constexpr size_t DIGEST_PREFIX_BYTES = 6;
@@ -60,13 +60,15 @@ static_assert(DIGEST_PREFIX_BYTES <= DIGEST_BYTES, "Digest prefix larger than di
 static_assert((DIGEST_PREFIX_BYTES * 8) <= SCORE_SHIFT, "Score shift too small for digest prefix");
 
 // Weight sizes and offsets
-constexpr size_t W1_SIZE = HIDDEN_DIM * INPUT_DIM;
-constexpr size_t B1_SIZE = HIDDEN_DIM;
-constexpr size_t W2_SIZE = HIDDEN_DIM * HIDDEN_DIM;
-constexpr size_t B2_SIZE = HIDDEN_DIM;
-constexpr size_t W3_SIZE = OUTPUT_DIM * HIDDEN_DIM;
-constexpr size_t B3_SIZE = OUTPUT_DIM;
-constexpr size_t TOTAL_WEIGHTS = W1_SIZE + B1_SIZE + W2_SIZE + B2_SIZE + W3_SIZE + B3_SIZE;
+constexpr size_t W1_SIZE = HIDDEN_DIM * INPUT_DIM;      // 256 * 32 = 8,192
+constexpr size_t B1_SIZE = HIDDEN_DIM;                   // 256
+constexpr size_t W2_SIZE = HIDDEN_DIM * HIDDEN_DIM;     // 256 * 256 = 65,536
+constexpr size_t B2_SIZE = HIDDEN_DIM;                   // 256
+constexpr size_t W3_SIZE = HIDDEN_DIM * HIDDEN_DIM;     // 256 * 256 = 65,536
+constexpr size_t B3_SIZE = HIDDEN_DIM;                   // 256
+constexpr size_t W4_SIZE = OUTPUT_DIM * HIDDEN_DIM;     // 32 * 256 = 8,192
+constexpr size_t B4_SIZE = OUTPUT_DIM;                   // 32
+constexpr size_t TOTAL_WEIGHTS = W1_SIZE + B1_SIZE + W2_SIZE + B2_SIZE + W3_SIZE + B3_SIZE + W4_SIZE + B4_SIZE;
 
 constexpr size_t W1_OFFSET = 0;
 constexpr size_t B1_OFFSET = W1_OFFSET + W1_SIZE;
@@ -74,6 +76,8 @@ constexpr size_t W2_OFFSET = B1_OFFSET + B1_SIZE;
 constexpr size_t B2_OFFSET = W2_OFFSET + W2_SIZE;
 constexpr size_t W3_OFFSET = B2_OFFSET + B2_SIZE;
 constexpr size_t B3_OFFSET = W3_OFFSET + W3_SIZE;
+constexpr size_t W4_OFFSET = B3_OFFSET + B3_SIZE;
+constexpr size_t B4_OFFSET = W4_OFFSET + W4_SIZE;
 
 // ============================================================================
 // CPU Verifier - MUST match GPU exactly
@@ -293,6 +297,7 @@ void get_outputs(const int8_t* weights, const uint8_t* nonce, float* out) {
     float input[INPUT_DIM];
     float hidden1[HIDDEN_DIM];
     float hidden2[HIDDEN_DIM];
+    float hidden3[HIDDEN_DIM];
 
     nonce_to_input(nonce, input);
 
@@ -301,7 +306,9 @@ void get_outputs(const int8_t* weights, const uint8_t* nonce, float* out) {
     layer_forward(weights + W2_OFFSET, weights + B2_OFFSET,
                   hidden1, hidden2, HIDDEN_DIM, HIDDEN_DIM, true);
     layer_forward(weights + W3_OFFSET, weights + B3_OFFSET,
-                  hidden2, out, HIDDEN_DIM, OUTPUT_DIM, false);
+                  hidden2, hidden3, HIDDEN_DIM, HIDDEN_DIM, true);
+    layer_forward(weights + W4_OFFSET, weights + B4_OFFSET,
+                  hidden3, out, HIDDEN_DIM, OUTPUT_DIM, false);
 }
 
 // Full forward pass - returns integer score
@@ -309,6 +316,7 @@ int64_t forward(const int8_t* weights, const uint8_t* nonce) {
     float input[INPUT_DIM];
     float hidden1[HIDDEN_DIM];
     float hidden2[HIDDEN_DIM];
+    float hidden3[HIDDEN_DIM];
     float output[OUTPUT_DIM];
 
     nonce_to_input(nonce, input);
@@ -327,7 +335,13 @@ int64_t forward(const int8_t* weights, const uint8_t* nonce) {
 
     layer_forward(
         weights + W3_OFFSET, weights + B3_OFFSET,
-        hidden2, output,
+        hidden2, hidden3,
+        HIDDEN_DIM, HIDDEN_DIM, true
+    );
+
+    layer_forward(
+        weights + W4_OFFSET, weights + B4_OFFSET,
+        hidden3, output,
         HIDDEN_DIM, OUTPUT_DIM, false
     );
 
@@ -614,8 +628,8 @@ bool create_gpu_context(cl_device_id device, int device_index, const SharedState
         return false;
     }
 
-    const char* src = reinterpret_cast<const char*>(src_neural_pow_cl);
-    size_t srcLen = src_neural_pow_cl_len;
+    const char* src = reinterpret_cast<const char*>(src_neurallenge_cl);
+    size_t srcLen = src_neurallenge_cl_len;
 
     ctx.program = clCreateProgramWithSource(ctx.context, 1, &src, &srcLen, &err);
     if (err != CL_SUCCESS) {
@@ -1001,7 +1015,7 @@ int main(int argc, char* argv[]) {
     generate_weights(shared.instance_id, shared.weights);
     std::cout << "Generated " << shared.weights.size() << " weight bytes" << std::endl;
 
-    std::cout << "Network: " << INPUT_DIM << " -> " << HIDDEN_DIM << " -> " << HIDDEN_DIM << " -> " << OUTPUT_DIM << std::endl;
+    std::cout << "Network: " << INPUT_DIM << " -> " << HIDDEN_DIM << " -> " << HIDDEN_DIM << " -> " << HIDDEN_DIM << " -> " << OUTPUT_DIM << std::endl;
     std::cout << "Global size: " << GLOBAL_SIZE << " threads per launch" << std::endl;
     std::cout << "Local size: " << LOCAL_SIZE << " threads per work-group" << std::endl;
 

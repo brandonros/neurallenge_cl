@@ -151,22 +151,24 @@ inline void generate_nonce(uint* s0, uint* s1, uchar* nonce) {
 }
 
 // ============================================================================
-// Network Architecture
+// Network Architecture: 32 -> 256 -> 256 -> 256 -> 32
 // ============================================================================
 
 #define INPUT_DIM 32
-#define HIDDEN_DIM 128
+#define HIDDEN_DIM 256
 #define OUTPUT_DIM 32
 #define DIGEST_BYTES OUTPUT_DIM
 #define DIGEST_PREFIX_BYTES 6
 #define SCORE_SHIFT 48
 
-#define W1_SIZE (HIDDEN_DIM * INPUT_DIM)
-#define B1_SIZE (HIDDEN_DIM)
-#define W2_SIZE (HIDDEN_DIM * HIDDEN_DIM)
-#define B2_SIZE (HIDDEN_DIM)
-#define W3_SIZE (OUTPUT_DIM * HIDDEN_DIM)
-#define B3_SIZE (OUTPUT_DIM)
+#define W1_SIZE (HIDDEN_DIM * INPUT_DIM)    // 256 * 32 = 8,192
+#define B1_SIZE (HIDDEN_DIM)                 // 256
+#define W2_SIZE (HIDDEN_DIM * HIDDEN_DIM)   // 256 * 256 = 65,536
+#define B2_SIZE (HIDDEN_DIM)                 // 256
+#define W3_SIZE (HIDDEN_DIM * HIDDEN_DIM)   // 256 * 256 = 65,536
+#define B3_SIZE (HIDDEN_DIM)                 // 256
+#define W4_SIZE (OUTPUT_DIM * HIDDEN_DIM)   // 32 * 256 = 8,192
+#define B4_SIZE (OUTPUT_DIM)                 // 32
 
 #define W1_OFFSET 0
 #define B1_OFFSET (W1_OFFSET + W1_SIZE)
@@ -174,6 +176,8 @@ inline void generate_nonce(uint* s0, uint* s1, uchar* nonce) {
 #define B2_OFFSET (W2_OFFSET + W2_SIZE)
 #define W3_OFFSET (B2_OFFSET + B2_SIZE)
 #define B3_OFFSET (W3_OFFSET + W3_SIZE)
+#define W4_OFFSET (B3_OFFSET + B3_SIZE)
+#define B4_OFFSET (W4_OFFSET + W4_SIZE)
 
 // ============================================================================
 // SipHash-2-4 - Proper cryptographic mixing for digest
@@ -343,6 +347,7 @@ __kernel void neural_pow_mine(
     float input[INPUT_DIM];
     float hidden1[HIDDEN_DIM];
     float hidden2[HIDDEN_DIM];
+    float hidden3[HIDDEN_DIM];
     float output[OUTPUT_DIM];
     uchar nonce[64];
 
@@ -354,24 +359,31 @@ __kernel void neural_pow_mine(
         nonce_to_input(nonce, input);
 
         // Forward pass
-        // Layer 1: 32 -> 128, ReLU
+        // Layer 1: 32 -> 256, ReLU
         layer_forward(
             weights + W1_OFFSET, weights + B1_OFFSET,
             input, hidden1,
             INPUT_DIM, HIDDEN_DIM, 1
         );
 
-        // Layer 2: 128 -> 128, ReLU
+        // Layer 2: 256 -> 256, ReLU
         layer_forward(
             weights + W2_OFFSET, weights + B2_OFFSET,
             hidden1, hidden2,
             HIDDEN_DIM, HIDDEN_DIM, 1
         );
 
-        // Layer 3: 128 -> 32, linear
+        // Layer 3: 256 -> 256, ReLU
         layer_forward(
             weights + W3_OFFSET, weights + B3_OFFSET,
-            hidden2, output,
+            hidden2, hidden3,
+            HIDDEN_DIM, HIDDEN_DIM, 1
+        );
+
+        // Layer 4: 256 -> 32, linear
+        layer_forward(
+            weights + W4_OFFSET, weights + B4_OFFSET,
+            hidden3, output,
             HIDDEN_DIM, OUTPUT_DIM, 0
         );
 
