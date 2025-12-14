@@ -32,11 +32,6 @@
 #define DEFAULT_USERNAME "anonymous"
 #endif
 
-// Platform-specific FTZ/DAZ control
-#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
-#include <xmmintrin.h>  // _mm_setcsr, _mm_getcsr
-#define HAS_MXCSR 1
-#endif
 
 #include "neurallenge_kernel.h"
 #include "neurallenge_config.h"
@@ -58,6 +53,10 @@ static_assert((DIGEST_PREFIX_BYTES * 8) <= SCORE_SHIFT, "Score shift too small f
 
 namespace cpu_verifier {
 
+// Weight/input scaling factors
+constexpr float WEIGHT_SCALE = 1.0f / 127.0f;   // int8 weights in [-127, 127]
+constexpr float INPUT_SCALE = 1.0f / 32768.0f;  // int16 inputs in [-32768, 32767]
+
 // Quantization using round-to-nearest-even (matches OpenCL convert_int_rte)
 // Use lrintf (float version) to match OpenCL's convert_int_rte(float) exactly
 inline float q16(float x) {
@@ -73,13 +72,13 @@ inline int32_t q16_to_int(float q16_val) {
 }
 
 inline float get_weight(const int8_t* weights, size_t idx) {
-    return static_cast<float>(weights[idx]) * (1.0f / 127.0f);
+    return static_cast<float>(weights[idx]) * WEIGHT_SCALE;
 }
 
 void nonce_to_input(const uint8_t* nonce, float* input) {
     for (int i = 0; i < INPUT_DIM; i++) {
         int16_t val = static_cast<int16_t>(nonce[i*2] | (nonce[i*2 + 1] << 8));
-        input[i] = q16(static_cast<float>(val) * (1.0f / 32768.0f));
+        input[i] = q16(static_cast<float>(val) * INPUT_SCALE);
     }
 }
 
@@ -95,7 +94,7 @@ float matmul_row(const int8_t* W, const int8_t* bias, const float* input, size_t
         }
     }
 
-    sum += static_cast<float>(*bias) * (1.0f / 127.0f);
+    sum += static_cast<float>(*bias) * WEIGHT_SCALE;
     return q16(sum);
 }
 
@@ -308,7 +307,8 @@ static const uint32_t K[64] = {
 #define SIG1(x) (ROTR(x, 17) ^ ROTR(x, 19) ^ ((x) >> 10))
 
 void hash(const uint8_t* data, size_t len, uint8_t* out) {
-    uint32_t h[8] = {
+    // State array (FIPS 180-4 uses H(0)..H(7))
+    uint32_t H[8] = {
         0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
         0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
     };
@@ -337,55 +337,30 @@ void hash(const uint8_t* data, size_t len, uint8_t* out) {
             w[i] = SIG1(w[i-2]) + w[i-7] + SIG0(w[i-15]) + w[i-16];
         }
 
-        uint32_t a = h[0], b = h[1], c = h[2], d = h[3];
-        uint32_t e = h[4], f = h[5], g = h[6], hh = h[7];
+        // Working variables a-h (FIPS 180-4 standard names)
+        uint32_t a = H[0], b = H[1], c = H[2], d = H[3];
+        uint32_t e = H[4], f = H[5], g = H[6], h = H[7];
 
         for (int i = 0; i < 64; i++) {
-            uint32_t t1 = hh + EP1(e) + CH(e, f, g) + K[i] + w[i];
+            uint32_t t1 = h + EP1(e) + CH(e, f, g) + K[i] + w[i];
             uint32_t t2 = EP0(a) + MAJ(a, b, c);
-            hh = g; g = f; f = e; e = d + t1;
+            h = g; g = f; f = e; e = d + t1;
             d = c; c = b; b = a; a = t1 + t2;
         }
 
-        h[0] += a; h[1] += b; h[2] += c; h[3] += d;
-        h[4] += e; h[5] += f; h[6] += g; h[7] += hh;
+        H[0] += a; H[1] += b; H[2] += c; H[3] += d;
+        H[4] += e; H[5] += f; H[6] += g; H[7] += h;
     }
 
     for (int i = 0; i < 8; i++) {
-        out[i*4] = (h[i] >> 24) & 0xFF;
-        out[i*4 + 1] = (h[i] >> 16) & 0xFF;
-        out[i*4 + 2] = (h[i] >> 8) & 0xFF;
-        out[i*4 + 3] = h[i] & 0xFF;
+        out[i*4] = (H[i] >> 24) & 0xFF;
+        out[i*4 + 1] = (H[i] >> 16) & 0xFF;
+        out[i*4 + 2] = (H[i] >> 8) & 0xFF;
+        out[i*4 + 3] = H[i] & 0xFF;
     }
 }
 
 } // namespace sha256
-
-void generate_weights(const std::string& challenge, std::vector<int8_t>& weights) {
-    weights.resize(TOTAL_WEIGHTS);
-
-    uint8_t hash_out[32];
-    size_t weight_idx = 0;
-    uint32_t counter = 0;
-
-    while (weight_idx < TOTAL_WEIGHTS) {
-        std::vector<uint8_t> input(challenge.begin(), challenge.end());
-        input.push_back((counter >> 0) & 0xFF);
-        input.push_back((counter >> 8) & 0xFF);
-        input.push_back((counter >> 16) & 0xFF);
-        input.push_back((counter >> 24) & 0xFF);
-
-        sha256::hash(input.data(), input.size(), hash_out);
-
-        for (int i = 0; i < 32 && weight_idx < TOTAL_WEIGHTS; i++) {
-            int8_t w = static_cast<int8_t>(hash_out[i]);
-            if (w == -128) w = -127;
-            weights[weight_idx++] = w;
-        }
-
-        counter++;
-    }
-}
 
 void append_u32(std::vector<uint8_t>& data, uint32_t value) {
     for (int i = 0; i < 4; i++) {
@@ -396,6 +371,29 @@ void append_u32(std::vector<uint8_t>& data, uint32_t value) {
 void append_u64(std::vector<uint8_t>& data, uint64_t value) {
     for (int i = 0; i < 8; i++) {
         data.push_back(static_cast<uint8_t>((value >> (i * 8)) & 0xFF));
+    }
+}
+
+void generate_weights(const std::string& challenge, std::vector<int8_t>& weights) {
+    weights.resize(TOTAL_WEIGHTS);
+
+    uint8_t hash_out[32];
+    size_t weight_idx = 0;
+    uint32_t counter = 0;
+
+    while (weight_idx < TOTAL_WEIGHTS) {
+        std::vector<uint8_t> input(challenge.begin(), challenge.end());
+        append_u32(input, counter);
+
+        sha256::hash(input.data(), input.size(), hash_out);
+
+        for (size_t i = 0; i < 32 && weight_idx < TOTAL_WEIGHTS; i++) {
+            int8_t w = static_cast<int8_t>(hash_out[i]);
+            if (w == -128) w = -127;
+            weights[weight_idx++] = w;
+        }
+
+        counter++;
     }
 }
 
@@ -750,15 +748,6 @@ void signal_handler(int) {
 void setup_fp_environment() {
     // Set rounding mode to round-to-nearest-even (matches OpenCL convert_int_rte)
     std::fesetround(FE_TONEAREST);
-
-#ifdef HAS_MXCSR
-    // Disable FTZ (Flush-To-Zero) and DAZ (Denormals-Are-Zero) on x86
-    // These can cause subtle differences between CPU and GPU
-    unsigned int mxcsr = _mm_getcsr();
-    mxcsr &= ~(1 << 15);  // Clear FTZ bit
-    mxcsr &= ~(1 << 6);   // Clear DAZ bit
-    _mm_setcsr(mxcsr);
-#endif
 }
 
 // ============================================================================
@@ -794,10 +783,14 @@ bool run_determinism_test(GPUContext& ctx, const SharedState& shared) {
         return false;
     }
 
-    // Verify lrintf behaves correctly for edge cases
-    // Test halfway cases (should round to even)
+    // Verify lrintf uses round-to-nearest-even (banker's rounding)
+    // This is critical for CPU/GPU determinism since OpenCL's convert_int_rte uses this mode
+    // Halfway values (x.5) round to the nearest even integer:
+    //   0.5 -> 0 (even), 1.5 -> 2 (even), 2.5 -> 2 (even)
+    //   -0.5 -> 0 (even), -1.5 -> -2 (even), -2.5 -> -2 (even)
+    // Non-halfway values round normally: 0.4999 -> 0, 0.5001 -> 1
     float test_vals[] = {0.5f, 1.5f, 2.5f, -0.5f, -1.5f, -2.5f, 0.4999f, 0.5001f};
-    int32_t expected[] = {0, 2, 2, 0, -2, -2, 0, 1};  // Round-to-nearest-even
+    int32_t expected[] = {0, 2, 2, 0, -2, -2, 0, 1};
 
     for (size_t i = 0; i < sizeof(test_vals) / sizeof(test_vals[0]); i++) {
         int32_t result = static_cast<int32_t>(std::lrintf(test_vals[i]));
@@ -828,14 +821,15 @@ int main(int argc, char* argv[]) {
     int target_zero_bits = 16;
     bool verbose = false;
 
-    auto apply_target_bits = [&](int bits) {
-        target_zero_bits = std::max(bits, 1);
-    };
+    // Option prefix lengths (compile-time)
+    constexpr size_t USER_PREFIX_LEN = sizeof("--user=") - 1;
+    constexpr size_t BITS_PREFIX_LEN = sizeof("--bits=") - 1;
+    constexpr size_t HEX_PREFIX_LEN = sizeof("--hex=") - 1;
 
     auto parse_bits_value = [&](const std::string& value, int multiplier) {
         try {
             int val = std::stoi(value);
-            apply_target_bits(val * multiplier);
+            target_zero_bits = std::max(val * multiplier, 1);
         } catch (const std::exception&) {
             std::cerr << "Invalid numeric target: " << value << std::endl;
             std::exit(1);
@@ -845,37 +839,39 @@ int main(int argc, char* argv[]) {
     std::vector<std::string> positional;
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
-        auto require_value = [&](const std::string& flag) -> std::string {
+
+        // Helper to get required next argument
+        auto require_next_arg = [&]() -> std::string {
             if (i + 1 >= argc) {
-                std::cerr << "Flag " << flag << " requires a value" << std::endl;
+                std::cerr << "Flag " << arg << " requires a value" << std::endl;
                 std::exit(1);
             }
             return std::string(argv[++i]);
         };
 
         if (arg == "--user" || arg == "-u") {
-            username = require_value(arg);
+            username = require_next_arg();
             continue;
         }
         if (arg.rfind("--user=", 0) == 0) {
-            username = arg.substr(std::string("--user=").size());
+            username = arg.substr(USER_PREFIX_LEN);
             continue;
         }
 
         if (arg == "--bits" || arg == "-b") {
-            parse_bits_value(require_value(arg), 1);
+            parse_bits_value(require_next_arg(), 1);
             continue;
         }
         if (arg == "--hex" || arg == "-x") {
-            parse_bits_value(require_value(arg), 4);
+            parse_bits_value(require_next_arg(), 4);
             continue;
         }
         if (arg.rfind("--bits=", 0) == 0) {
-            parse_bits_value(arg.substr(std::string("--bits=").size()), 1);
+            parse_bits_value(arg.substr(BITS_PREFIX_LEN), 1);
             continue;
         }
         if (arg.rfind("--hex=", 0) == 0) {
-            parse_bits_value(arg.substr(std::string("--hex=").size()), 4);
+            parse_bits_value(arg.substr(HEX_PREFIX_LEN), 4);
             continue;
         }
 

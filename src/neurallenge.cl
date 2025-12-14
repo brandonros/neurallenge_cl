@@ -45,8 +45,11 @@ inline int q16_to_int(float q16_val) {
 // Weight Access - int8 weights scaled to ~[-1, 1]
 // ============================================================================
 
+#define WEIGHT_SCALE (1.0f / 127.0f)   // int8 weights in [-127, 127]
+#define INPUT_SCALE (1.0f / 32768.0f)  // int16 inputs in [-32768, 32767]
+
 inline float get_weight(__global const char* weights, uint idx) {
-    return (float)weights[idx] * (1.0f / 127.0f);
+    return (float)weights[idx] * WEIGHT_SCALE;
 }
 
 // ============================================================================
@@ -71,7 +74,7 @@ inline float matmul_row(
         }
     }
 
-    sum += (float)(*bias) * (1.0f / 127.0f);
+    sum += (float)(*bias) * WEIGHT_SCALE;
 
     return q16(sum);
 }
@@ -101,7 +104,7 @@ inline void nonce_to_input(const uchar* nonce, float* input) {
     for (int i = 0; i < INPUT_DIM; i++) {
         // Little-endian int16
         short val = (short)(nonce[i*2] | (nonce[i*2 + 1] << 8));
-        input[i] = q16((float)val * (1.0f / 32768.0f));
+        input[i] = q16((float)val * INPUT_SCALE);
     }
 }
 
@@ -250,10 +253,9 @@ inline int count_leading_zero_bits(const uchar* digest, uint len) {
             continue;
         }
         int lz = 0;
-        uchar mask = 0x80;
-        while ((b & mask) == 0) {
+        while ((b & 0x80u) == 0) {
             lz++;
-            mask >>= 1;
+            b <<= 1;
         }
         bits += lz;
         break;
