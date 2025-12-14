@@ -27,18 +27,24 @@ inline uint reserve_slot(FOUND_COUNT_T p) {
 // Quantization - Bit-exact fixed-point conversion
 // ============================================================================
 
+// Q16 fixed-point constants (16 fractional bits)
+#define Q16_SCALE 65536.0f
+#define Q16_INV_SCALE (1.0f / 65536.0f)
+#define Q16_MIN -32768.0f
+#define Q16_MAX 32767.0f
+
 // Quantization using convert_int_rte (OpenCL spec-defined round-to-nearest-even)
 // This is the most deterministic option the spec provides
 inline float q16(float x) {
     if (!isfinite(x)) x = 0.0f;
-    x = clamp(x, -32768.0f, 32767.0f);
-    int i = convert_int_rte(x * 65536.0f);
-    return (float)i * (1.0f / 65536.0f);
+    x = clamp(x, Q16_MIN, Q16_MAX);
+    int i = convert_int_rte(x * Q16_SCALE);
+    return (float)i * Q16_INV_SCALE;
 }
 
 // Get the integer representation of a q16 value (for deterministic scoring)
 inline int q16_to_int(float q16_val) {
-    return convert_int_rte(q16_val * 65536.0f);
+    return convert_int_rte(q16_val * Q16_SCALE);
 }
 
 // ============================================================================

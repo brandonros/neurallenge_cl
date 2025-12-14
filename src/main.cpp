@@ -33,8 +33,8 @@
 #endif
 
 
-#include "neurallenge_kernel.h"
-#include "neurallenge_config.h"
+#include "kernel_embedded.h"
+#include "config.h"
 
 // ============================================================================
 // Configuration
@@ -57,18 +57,24 @@ namespace cpu_verifier {
 constexpr float WEIGHT_SCALE = 1.0f / 127.0f;   // int8 weights in [-127, 127]
 constexpr float INPUT_SCALE = 1.0f / 32768.0f;  // int16 inputs in [-32768, 32767]
 
+// Q16 fixed-point constants (16 fractional bits)
+constexpr float Q16_SCALE = 65536.0f;           // 2^16
+constexpr float Q16_INV_SCALE = 1.0f / 65536.0f;
+constexpr float Q16_MIN = -32768.0f;            // Min value before overflow when scaled
+constexpr float Q16_MAX = 32767.0f;             // Max value before overflow when scaled
+
 // Quantization using round-to-nearest-even (matches OpenCL convert_int_rte)
 // Use lrintf (float version) to match OpenCL's convert_int_rte(float) exactly
 inline float q16(float x) {
     if (!std::isfinite(x)) x = 0.0f;
-    x = std::max(-32768.0f, std::min(32767.0f, x));
-    int32_t i = static_cast<int32_t>(std::lrintf(x * 65536.0f));
-    return static_cast<float>(i) * (1.0f / 65536.0f);
+    x = std::max(Q16_MIN, std::min(Q16_MAX, x));
+    int32_t i = static_cast<int32_t>(std::lrintf(x * Q16_SCALE));
+    return static_cast<float>(i) * Q16_INV_SCALE;
 }
 
 // Get q16 as integer representation (for deterministic scoring)
 inline int32_t q16_to_int(float q16_val) {
-    return static_cast<int32_t>(std::lrintf(q16_val * 65536.0f));
+    return static_cast<int32_t>(std::lrintf(q16_val * Q16_SCALE));
 }
 
 inline float get_weight(const int8_t* weights, size_t idx) {
@@ -451,6 +457,7 @@ struct GPUContext {
     std::atomic<uint64_t> evals_computed{0};
     std::atomic<uint64_t> matches_found{0};
     std::atomic<uint64_t> launch_counter{0};
+    std::atomic<uint64_t> total_kernel_time_us{0};  // Total kernel time in microseconds
 };
 
 // ============================================================================
@@ -556,8 +563,8 @@ bool create_gpu_context(cl_device_id device, int device_index, const SharedState
         return false;
     }
 
-    const char* src = reinterpret_cast<const char*>(src_neurallenge_cl);
-    size_t srcLen = src_neurallenge_cl_len;
+    const char* src = reinterpret_cast<const char*>(kernel_cl);
+    size_t srcLen = kernel_cl_len;
 
     ctx.program = clCreateProgramWithSource(ctx.context, 1, &src, &srcLen, &err);
     if (err != CL_SUCCESS) {
@@ -640,6 +647,8 @@ void gpu_worker_thread(GPUContext& ctx, SharedState& shared) {
 
         size_t global_size = GLOBAL_SIZE;
         size_t local_size = LOCAL_SIZE;
+
+        auto kernel_start = std::chrono::steady_clock::now();
         cl_int err = clEnqueueNDRangeKernel(ctx.queue, ctx.kernel, 1, nullptr, &global_size, &local_size, 0, nullptr, nullptr);
         if (err != CL_SUCCESS) {
             std::cerr << "[GPU " << ctx.device_index << "] Kernel error: " << err << std::endl;
@@ -647,6 +656,9 @@ void gpu_worker_thread(GPUContext& ctx, SharedState& shared) {
         }
 
         clFinish(ctx.queue);
+        auto kernel_end = std::chrono::steady_clock::now();
+        auto kernel_us = std::chrono::duration_cast<std::chrono::microseconds>(kernel_end - kernel_start).count();
+        ctx.total_kernel_time_us.fetch_add(static_cast<uint64_t>(kernel_us));
         ctx.evals_computed.fetch_add(static_cast<uint64_t>(GLOBAL_SIZE) * HASHES_PER_THREAD);
 
         cl_uint found_count;
@@ -974,9 +986,13 @@ int main(int argc, char* argv[]) {
 
         uint64_t total_evals = 0;
         uint64_t total_matches = 0;
+        uint64_t total_launches = 0;
+        uint64_t total_kernel_time_us = 0;
         for (const auto& gpu : gpus) {
             total_evals += gpu.evals_computed.load();
             total_matches += gpu.matches_found.load();
+            total_launches += gpu.launch_counter.load();
+            total_kernel_time_us += gpu.total_kernel_time_us.load();
         }
 
         auto now = std::chrono::steady_clock::now();
@@ -996,11 +1012,14 @@ int main(int argc, char* argv[]) {
         }
 
         if (total_evals > 0) {
+            double avg_kernel_ms = (total_launches > 0) ?
+                static_cast<double>(total_kernel_time_us) / total_launches / 1000.0 : 0;
             std::cout << "\r[Stats] " << std::fixed << std::setprecision(2)
                       << (recent_rate / 1e6) << " M evals/s, "
                       << std::setprecision(3) << (total_evals / 1e9) << "B evals, "
                       << total_matches << " improvements, "
-                      << "best=" << current_bits << " LZ bits"
+                      << "best=" << current_bits << " LZ bits, "
+                      << std::setprecision(1) << avg_kernel_ms << "ms/kernel"
                       << ", " << elapsed << "s        " << std::flush;
         } else {
             std::cout << "\r[Stats] Waiting for first kernel to complete... " << elapsed << "s" << std::flush;
