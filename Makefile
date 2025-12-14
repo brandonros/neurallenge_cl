@@ -36,15 +36,17 @@ all: $(OUTDIR) $(EXE)
 $(OUTDIR):
 	mkdir -p $(OUTDIR)
 
-# Generate header from kernel source
-$(OUTDIR)/neurallenge_kernel.h: src/neurallenge.cl | $(OUTDIR)
-	xxd -i $< > $@
+# Generate combined kernel source (config + kernel), then convert to header
+$(OUTDIR)/neurallenge_kernel.h: src/neurallenge_config.h src/neurallenge.cl | $(OUTDIR)
+	cat src/neurallenge_config.h src/neurallenge.cl > $(OUTDIR)/neurallenge_combined.cl
+	xxd -i $(OUTDIR)/neurallenge_combined.cl > $@
+	sed -i.bak 's/output_neurallenge_combined_cl/src_neurallenge_cl/g' $@ && rm -f $@.bak
 
 $(EXE): $(OUTDIR)/main.o
 	$(CC) $< $(LDFLAGS) -o $@
 
-$(OUTDIR)/main.o: src/main.cpp $(OUTDIR)/neurallenge_kernel.h | $(OUTDIR)
-	$(CC) $(CFLAGS) $(CDEFINES) -I$(OUTDIR) $< -o $@
+$(OUTDIR)/main.o: src/main.cpp src/neurallenge_config.h $(OUTDIR)/neurallenge_kernel.h | $(OUTDIR)
+	$(CC) $(CFLAGS) $(CDEFINES) -I$(OUTDIR) -Isrc $< -o $@
 
 clean:
 	rm -rf $(OUTDIR)

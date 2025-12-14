@@ -42,14 +42,6 @@ inline int q16_to_int(float q16_val) {
 }
 
 // ============================================================================
-// Activation Functions
-// ============================================================================
-
-inline float relu_q16(float x) {
-    return q16(fmax(0.0f, x));
-}
-
-// ============================================================================
 // Weight Access - int8 weights scaled to ~[-1, 1]
 // ============================================================================
 
@@ -84,7 +76,8 @@ inline float matmul_row(
     return q16(sum);
 }
 
-// Full layer: output = activation(W @ input + bias), quantized to q16 grid
+// Full layer: output = activation(W @ input + bias)
+// Note: matmul_row returns q16, and ReLU(q16) stays on grid (0.0f or unchanged)
 inline void layer_forward(
     __global const char* W,      // [out_dim x in_dim]
     __global const char* bias,   // [out_dim]
@@ -96,8 +89,7 @@ inline void layer_forward(
 ) {
     for (uint i = 0; i < out_dim; i++) {
         float sum = matmul_row(W + i * in_dim, bias + i, input, in_dim);
-        float activated = use_relu ? fmax(0.0f, sum) : sum;
-        output[i] = q16(activated);
+        output[i] = use_relu ? fmax(0.0f, sum) : sum;
     }
 }
 
@@ -150,34 +142,7 @@ inline void generate_nonce(uint* s0, uint* s1, uchar* nonce) {
     }
 }
 
-// ============================================================================
-// Network Architecture: 32 -> 256 -> 256 -> 256 -> 32
-// ============================================================================
-
-#define INPUT_DIM 32
-#define HIDDEN_DIM 256
-#define OUTPUT_DIM 32
-#define DIGEST_BYTES OUTPUT_DIM
-#define DIGEST_PREFIX_BYTES 6
-#define SCORE_SHIFT 48
-
-#define W1_SIZE (HIDDEN_DIM * INPUT_DIM)    // 256 * 32 = 8,192
-#define B1_SIZE (HIDDEN_DIM)                 // 256
-#define W2_SIZE (HIDDEN_DIM * HIDDEN_DIM)   // 256 * 256 = 65,536
-#define B2_SIZE (HIDDEN_DIM)                 // 256
-#define W3_SIZE (HIDDEN_DIM * HIDDEN_DIM)   // 256 * 256 = 65,536
-#define B3_SIZE (HIDDEN_DIM)                 // 256
-#define W4_SIZE (OUTPUT_DIM * HIDDEN_DIM)   // 32 * 256 = 8,192
-#define B4_SIZE (OUTPUT_DIM)                 // 32
-
-#define W1_OFFSET 0
-#define B1_OFFSET (W1_OFFSET + W1_SIZE)
-#define W2_OFFSET (B1_OFFSET + B1_SIZE)
-#define B2_OFFSET (W2_OFFSET + W2_SIZE)
-#define W3_OFFSET (B2_OFFSET + B2_SIZE)
-#define B3_OFFSET (W3_OFFSET + W3_SIZE)
-#define W4_OFFSET (B3_OFFSET + B3_SIZE)
-#define B4_OFFSET (W4_OFFSET + W4_SIZE)
+// Network architecture constants come from neurallenge_config.h (prepended by Makefile)
 
 // ============================================================================
 // SipHash-2-4 - Proper cryptographic mixing for digest
@@ -242,37 +207,30 @@ inline ulong siphash_2_4_132(const uchar* data, ulong k0, ulong k1) {
     return v0 ^ v1 ^ v2 ^ v3;
 }
 
-// Fixed SipHash key derived from "NeuralPoW" (arbitrary but deterministic)
-#define SIPHASH_K0 0x4e657572616c506fUL
-#define SIPHASH_K1 0x5720446967657374UL
+// SipHash keys defined in neurallenge_config.h
 
 // ============================================================================
 // Score Computation - Neural digest leading zeros
 // ============================================================================
 
 inline void compute_digest(const float* output, uchar* digest, uint dim) {
-    // Serialize q16 integers to bytes (little-endian)
-    uchar serialized[128];
+    // Serialize q16 integers directly into SipHash input buffer
+    uchar input[SIPHASH_INPUT_BYTES];
     for (uint i = 0; i < dim; i++) {
         int val = q16_to_int(output[i]);
-        serialized[i * 4 + 0] = (uchar)(val & 0xFF);
-        serialized[i * 4 + 1] = (uchar)((val >> 8) & 0xFF);
-        serialized[i * 4 + 2] = (uchar)((val >> 16) & 0xFF);
-        serialized[i * 4 + 3] = (uchar)((val >> 24) & 0xFF);
+        input[i * 4 + 0] = (uchar)(val & 0xFF);
+        input[i * 4 + 1] = (uchar)((val >> 8) & 0xFF);
+        input[i * 4 + 2] = (uchar)((val >> 16) & 0xFF);
+        input[i * 4 + 3] = (uchar)((val >> 24) & 0xFF);
     }
+    // Zero-pad domain separator (only first byte changes per block)
+    input[SERIALIZED_OUTPUT_BYTES + 1] = 0;
+    input[SERIALIZED_OUTPUT_BYTES + 2] = 0;
+    input[SERIALIZED_OUTPUT_BYTES + 3] = 0;
 
-    // Generate 32 bytes of digest using SipHash with domain separation
-    for (uint block = 0; block < 4; block++) {
-        // Build input with domain separator
-        uchar input[132];
-        for (int i = 0; i < 128; i++) {
-            input[i] = serialized[i];
-        }
-        input[128] = (uchar)block;
-        input[129] = 0;
-        input[130] = 0;
-        input[131] = 0;
-
+    // Generate DIGEST_BYTES of digest using SipHash with domain separation
+    for (uint block = 0; block < (DIGEST_BYTES / 8); block++) {
+        input[SERIALIZED_OUTPUT_BYTES] = (uchar)block;
         ulong h = siphash_2_4_132(input, SIPHASH_K0, SIPHASH_K1);
 
         // Extract 8 bytes from hash (little-endian)
@@ -319,12 +277,6 @@ inline long compute_score_int(const float* output, uint dim) {
 }
 
 // ============================================================================
-// Result Limits
-// ============================================================================
-
-#define MAX_RESULTS 64
-
-// ============================================================================
 // Main Kernel
 // ============================================================================
 
@@ -349,7 +301,7 @@ __kernel void neural_pow_mine(
     float hidden2[HIDDEN_DIM];
     float hidden3[HIDDEN_DIM];
     float output[OUTPUT_DIM];
-    uchar nonce[64];
+    uchar nonce[NONCE_BYTES];
 
     for (int iter = 0; iter < HASHES_PER_THREAD; iter++) {
         // Generate random nonce
@@ -397,8 +349,8 @@ __kernel void neural_pow_mine(
             if (slot < MAX_RESULTS) {
                 found_scores[slot] = score;
 
-                __global uchar* nonce_out = found_nonces + slot * 64;
-                for (int i = 0; i < 64; i++) {
+                __global uchar* nonce_out = found_nonces + slot * NONCE_BYTES;
+                for (int i = 0; i < NONCE_BYTES; i++) {
                     nonce_out[i] = nonce[i];
                 }
             }

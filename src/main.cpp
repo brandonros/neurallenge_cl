@@ -39,6 +39,7 @@
 #endif
 
 #include "neurallenge_kernel.h"
+#include "neurallenge_config.h"
 
 // ============================================================================
 // Configuration
@@ -47,37 +48,9 @@
 #define STRINGIFY_(x) #x
 #define STRINGIFY(x) STRINGIFY_(x)
 
-constexpr size_t MAX_RESULTS = 64;
-
-// Network architecture: 32 -> 256 -> 256 -> 256 -> 32
-constexpr size_t INPUT_DIM = 32;
-constexpr size_t HIDDEN_DIM = 256;
-constexpr size_t OUTPUT_DIM = 32;
-constexpr size_t DIGEST_BYTES = OUTPUT_DIM;
-constexpr size_t DIGEST_PREFIX_BYTES = 6;
-constexpr int SCORE_SHIFT = 48;
+// Static assertions for config sanity
 static_assert(DIGEST_PREFIX_BYTES <= DIGEST_BYTES, "Digest prefix larger than digest");
 static_assert((DIGEST_PREFIX_BYTES * 8) <= SCORE_SHIFT, "Score shift too small for digest prefix");
-
-// Weight sizes and offsets
-constexpr size_t W1_SIZE = HIDDEN_DIM * INPUT_DIM;      // 256 * 32 = 8,192
-constexpr size_t B1_SIZE = HIDDEN_DIM;                   // 256
-constexpr size_t W2_SIZE = HIDDEN_DIM * HIDDEN_DIM;     // 256 * 256 = 65,536
-constexpr size_t B2_SIZE = HIDDEN_DIM;                   // 256
-constexpr size_t W3_SIZE = HIDDEN_DIM * HIDDEN_DIM;     // 256 * 256 = 65,536
-constexpr size_t B3_SIZE = HIDDEN_DIM;                   // 256
-constexpr size_t W4_SIZE = OUTPUT_DIM * HIDDEN_DIM;     // 32 * 256 = 8,192
-constexpr size_t B4_SIZE = OUTPUT_DIM;                   // 32
-constexpr size_t TOTAL_WEIGHTS = W1_SIZE + B1_SIZE + W2_SIZE + B2_SIZE + W3_SIZE + B3_SIZE + W4_SIZE + B4_SIZE;
-
-constexpr size_t W1_OFFSET = 0;
-constexpr size_t B1_OFFSET = W1_OFFSET + W1_SIZE;
-constexpr size_t W2_OFFSET = B1_OFFSET + B1_SIZE;
-constexpr size_t B2_OFFSET = W2_OFFSET + W2_SIZE;
-constexpr size_t W3_OFFSET = B2_OFFSET + B2_SIZE;
-constexpr size_t B3_OFFSET = W3_OFFSET + W3_SIZE;
-constexpr size_t W4_OFFSET = B3_OFFSET + B3_SIZE;
-constexpr size_t B4_OFFSET = W4_OFFSET + W4_SIZE;
 
 // ============================================================================
 // CPU Verifier - MUST match GPU exactly
@@ -97,10 +70,6 @@ inline float q16(float x) {
 // Get q16 as integer representation (for deterministic scoring)
 inline int32_t q16_to_int(float q16_val) {
     return static_cast<int32_t>(std::lrintf(q16_val * 65536.0f));
-}
-
-inline float relu_q16(float x) {
-    return q16(std::max(0.0f, x));
 }
 
 inline float get_weight(const int8_t* weights, size_t idx) {
@@ -130,6 +99,7 @@ float matmul_row(const int8_t* W, const int8_t* bias, const float* input, size_t
     return q16(sum);
 }
 
+// Note: matmul_row returns q16, and ReLU(q16) stays on grid (0.0f or unchanged)
 void layer_forward(
     const int8_t* W,
     const int8_t* bias,
@@ -141,8 +111,7 @@ void layer_forward(
 ) {
     for (size_t i = 0; i < out_dim; i++) {
         float sum = matmul_row(W + i * in_dim, bias + i, input, in_dim);
-        float activated = use_relu ? std::max(0.0f, sum) : sum;
-        output[i] = q16(activated);
+        output[i] = use_relu ? std::max(0.0f, sum) : sum;
     }
 }
 
@@ -216,32 +185,27 @@ uint64_t siphash_2_4(const uint8_t* data, size_t len, uint64_t k0, uint64_t k1) 
     return v0 ^ v1 ^ v2 ^ v3;
 }
 
-// Fixed SipHash key derived from "NeuralPoW" (arbitrary but deterministic)
-constexpr uint64_t SIPHASH_K0 = 0x4e657572616c506fULL;  // "NeuralPo"
-constexpr uint64_t SIPHASH_K1 = 0x5720446967657374ULL;  // "W Digest"
+// SipHash keys defined in neurallenge_config.h
 
 void compute_digest(const float* output, uint8_t* digest, size_t dim) {
-    // Serialize q16 integers to bytes (little-endian)
-    uint8_t serialized[128];  // 32 * 4 bytes
+    // Serialize q16 integers directly into SipHash input buffer
+    uint8_t input[SIPHASH_INPUT_BYTES];
     for (size_t i = 0; i < dim; i++) {
         int32_t val = q16_to_int(output[i]);
-        serialized[i * 4 + 0] = static_cast<uint8_t>(val & 0xFF);
-        serialized[i * 4 + 1] = static_cast<uint8_t>((val >> 8) & 0xFF);
-        serialized[i * 4 + 2] = static_cast<uint8_t>((val >> 16) & 0xFF);
-        serialized[i * 4 + 3] = static_cast<uint8_t>((val >> 24) & 0xFF);
+        input[i * 4 + 0] = static_cast<uint8_t>(val & 0xFF);
+        input[i * 4 + 1] = static_cast<uint8_t>((val >> 8) & 0xFF);
+        input[i * 4 + 2] = static_cast<uint8_t>((val >> 16) & 0xFF);
+        input[i * 4 + 3] = static_cast<uint8_t>((val >> 24) & 0xFF);
     }
+    // Zero-pad domain separator (only first byte changes per block)
+    input[SERIALIZED_OUTPUT_BYTES + 1] = 0;
+    input[SERIALIZED_OUTPUT_BYTES + 2] = 0;
+    input[SERIALIZED_OUTPUT_BYTES + 3] = 0;
 
-    // Generate 32 bytes of digest using SipHash with domain separation
-    for (size_t block = 0; block < 4; block++) {
-        // Append block index for domain separation
-        uint8_t input[132];
-        memcpy(input, serialized, 128);
-        input[128] = static_cast<uint8_t>(block);
-        input[129] = 0;
-        input[130] = 0;
-        input[131] = 0;
-
-        uint64_t h = siphash_2_4(input, 132, SIPHASH_K0, SIPHASH_K1);
+    // Generate DIGEST_BYTES of digest using SipHash with domain separation
+    for (size_t block = 0; block < (DIGEST_BYTES / 8); block++) {
+        input[SERIALIZED_OUTPUT_BYTES] = static_cast<uint8_t>(block);
+        uint64_t h = siphash_2_4(input, SIPHASH_INPUT_BYTES, SIPHASH_K0, SIPHASH_K1);
 
         // Extract 8 bytes from hash (little-endian)
         for (int i = 0; i < 8; i++) {
@@ -663,7 +627,7 @@ bool create_gpu_context(cl_device_id device, int device_index, const SharedState
 
     ctx.found_count_buf = clCreateBuffer(ctx.context, CL_MEM_READ_WRITE, sizeof(cl_uint), nullptr, &err);
     ctx.found_scores_buf = clCreateBuffer(ctx.context, CL_MEM_WRITE_ONLY, MAX_RESULTS * sizeof(cl_long), nullptr, &err);
-    ctx.found_nonces_buf = clCreateBuffer(ctx.context, CL_MEM_WRITE_ONLY, MAX_RESULTS * 64, nullptr, &err);
+    ctx.found_nonces_buf = clCreateBuffer(ctx.context, CL_MEM_WRITE_ONLY, MAX_RESULTS * NONCE_BYTES, nullptr, &err);
 
     if (err != CL_SUCCESS) {
         std::cerr << "[GPU " << device_index << "] Failed to create result buffers: " << err << std::endl;
@@ -725,15 +689,15 @@ void gpu_worker_thread(GPUContext& ctx, SharedState& shared) {
         clEnqueueReadBuffer(ctx.queue, ctx.found_count_buf, CL_TRUE, 0, sizeof(cl_uint), &found_count, 0, nullptr, nullptr);
 
         if (found_count > 0) {
-            size_t results_to_read = std::min(static_cast<size_t>(found_count), MAX_RESULTS);
+            size_t results_to_read = std::min(static_cast<size_t>(found_count), static_cast<size_t>(MAX_RESULTS));
 
             std::vector<int64_t> all_scores(results_to_read);
-            std::vector<uint8_t> all_nonces(results_to_read * 64);
+            std::vector<uint8_t> all_nonces(results_to_read * NONCE_BYTES);
 
             clEnqueueReadBuffer(ctx.queue, ctx.found_scores_buf, CL_TRUE, 0,
                                results_to_read * sizeof(int64_t), all_scores.data(), 0, nullptr, nullptr);
             clEnqueueReadBuffer(ctx.queue, ctx.found_nonces_buf, CL_TRUE, 0,
-                               results_to_read * 64, all_nonces.data(), 0, nullptr, nullptr);
+                               results_to_read * NONCE_BYTES, all_nonces.data(), 0, nullptr, nullptr);
 
             // Find best in batch
             size_t best_idx = 0;
@@ -744,7 +708,7 @@ void gpu_worker_thread(GPUContext& ctx, SharedState& shared) {
             }
 
             int64_t batch_best_score = all_scores[best_idx];
-            uint8_t* batch_best_nonce = all_nonces.data() + best_idx * 64;
+            uint8_t* batch_best_nonce = all_nonces.data() + best_idx * NONCE_BYTES;
 
             // Verify on CPU - must match bit-exactly (consensus requirement)
             int64_t cpu_score = cpu_verifier::forward(shared.weights.data(), batch_best_nonce);
@@ -768,10 +732,10 @@ void gpu_worker_thread(GPUContext& ctx, SharedState& shared) {
                     cpu_verifier::compute_digest(outputs, digest, OUTPUT_DIM);
                     int lz_bits = cpu_verifier::count_leading_zero_bits(digest, DIGEST_BYTES);
                     std::string digest_hex = digest_to_hex(digest, DIGEST_BYTES);
-                    std::string nonce_hex = nonce_to_hex(batch_best_nonce, 64);
+                    std::string nonce_hex = nonce_to_hex(batch_best_nonce, NONCE_BYTES);
 
                     shared.best_score = cpu_score;
-                    shared.best_nonce.assign(batch_best_nonce, batch_best_nonce + 64);
+                    shared.best_nonce.assign(batch_best_nonce, batch_best_nonce + NONCE_BYTES);
                     shared.best_digest.assign(digest, digest + DIGEST_BYTES);
                     ctx.matches_found.fetch_add(1);
 
@@ -837,8 +801,8 @@ void setup_fp_environment() {
 
 bool run_golden_vector_test(GPUContext& ctx, const SharedState& shared) {
     // Fixed test nonce (deterministic)
-    uint8_t test_nonce[64];
-    for (int i = 0; i < 64; i++) {
+    uint8_t test_nonce[NONCE_BYTES];
+    for (int i = 0; i < NONCE_BYTES; i++) {
         test_nonce[i] = static_cast<uint8_t>((i * 37 + 13) & 0xFF);
     }
 
@@ -1038,6 +1002,12 @@ int main(int argc, char* argv[]) {
         std::cout << "Initialized GPU " << i << ": " << gpus[i].device_name << std::endl;
     }
 
+    // Run golden vector test to verify determinism
+    if (!run_golden_vector_test(gpus[0], shared)) {
+        std::cerr << "Golden vector test failed! Aborting." << std::endl;
+        return 1;
+    }
+
     std::cout << "\nMining started...\n" << std::endl;
 
     std::vector<std::thread> worker_threads;
@@ -1113,7 +1083,7 @@ int main(int argc, char* argv[]) {
         cpu_verifier::compute_digest(outputs, digest, OUTPUT_DIM);
         int lz_bits = cpu_verifier::count_leading_zero_bits(digest, DIGEST_BYTES);
         std::string digest_hex = digest_to_hex(digest, DIGEST_BYTES);
-        std::string nonce_hex = nonce_to_hex(shared.best_nonce.data(), 64);
+        std::string nonce_hex = nonce_to_hex(shared.best_nonce.data(), NONCE_BYTES);
 
         std::cout << "\nBest Result: " << describe_lz_bits(lz_bits) << std::endl;
         std::cout << "Digest: " << format_digest_with_marker(digest_hex, lz_bits) << std::endl;
