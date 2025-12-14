@@ -445,25 +445,7 @@ std::string bytes_to_hex(const uint8_t* data, size_t len) {
 }
 
 std::string describe_lz_bits(int bits) {
-    std::ostringstream oss;
-    int hex_digits = bits / 4;
-    int hex_bits = bits % 4;
-    int bytes = bits / 8;
-    int rem_bits = bits % 8;
-
-    oss << bits << " bits ("
-        << hex_digits << " hex digit" << (hex_digits == 1 ? "" : "s");
-    if (hex_bits > 0) {
-        oss << " + " << hex_bits << " bit";
-        if (hex_bits != 1) oss << "s";
-    }
-    oss << "; " << bytes << " byte" << (bytes == 1 ? "" : "s");
-    if (rem_bits > 0) {
-        oss << " + " << rem_bits << " bit";
-        if (rem_bits != 1) oss << "s";
-    }
-    oss << ")";
-    return oss.str();
+    return std::to_string(bits) + " bits";
 }
 
 std::string format_digest_with_marker(const std::string& hex, int lz_bits) {

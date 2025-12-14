@@ -4,14 +4,16 @@ GPU proof-of-work using FP32 neural network inference.
 
 ## How it works
 
-1. **Epoch string (`epoch0`) → SHA-256 → deterministic int8 weights (~148KB)**
-   Everyone mines the same neural network for a fair leaderboard.
+Like Shallenge, but with a neural network in the middle:
 
-2. **Random 64-byte nonce → 32 Q16 floats → forward pass → 32 Q16 outputs**
-   MLP with ReLU: 32→256→256→256→32. All math snapped to Q16 grid for CPU/GPU determinism.
+1. **Epoch string → SHA-256 → ~148KB of neural network weights**
+   Everyone mines the same network for a fair leaderboard.
+
+2. **Random nonce → neural network → 32 output values**
+   The network has 4 layers (32→256→256→256→32) of FP32 multiply-adds.
 
 3. **Output → SipHash-2-4 → 32-byte digest → count leading zero bits**
-   More zeros = better proof. Proof format: `username/nonce`.
+   More zeros = better proof. Format: `username/nonce`.
 
 ## vs Shallenge
 
