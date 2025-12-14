@@ -800,11 +800,17 @@ void setup_fp_environment() {
 // ============================================================================
 
 bool run_golden_vector_test(GPUContext& ctx, const SharedState& shared) {
-    // Fixed test nonce (deterministic)
+    // Known good nonce that produces 27 leading zero bits with default challenge
+    // Challenge: "neural_pow_test/epoch0:brandonros"
+    // Expected digest: 0000001772c85c985cd67e6904ae09666c2bdd8396161b63e91e8b05319e770d
+    static const uint8_t golden_nonce[NONCE_BYTES] = {
+        0x66, 0x74, 0x16, 0xa7, 0x75, 0x95, 0xa3, 0x2c, 0x55, 0xf6, 0x17, 0x31, 0xdc, 0x51, 0x20, 0x35,
+        0x0e, 0x4d, 0x6e, 0x80, 0x71, 0x60, 0x2c, 0x2c, 0xf8, 0xc8, 0xfb, 0x59, 0x56, 0x57, 0xe5, 0xd8,
+        0x88, 0xac, 0xbf, 0x14, 0x67, 0xe9, 0x23, 0x45, 0xac, 0x19, 0xe9, 0x0c, 0x65, 0xf8, 0x2f, 0x19,
+        0xe2, 0x26, 0x51, 0x20, 0x53, 0x60, 0xfc, 0xf6, 0xbc, 0xb4, 0x98, 0x85, 0x85, 0xc5, 0x79, 0xfe
+    };
     uint8_t test_nonce[NONCE_BYTES];
-    for (int i = 0; i < NONCE_BYTES; i++) {
-        test_nonce[i] = static_cast<uint8_t>((i * 37 + 13) & 0xFF);
-    }
+    memcpy(test_nonce, golden_nonce, NONCE_BYTES);
 
     // CPU computation
     int64_t cpu_score = cpu_verifier::forward(shared.weights.data(), test_nonce);
@@ -826,6 +832,19 @@ bool run_golden_vector_test(GPUContext& ctx, const SharedState& shared) {
         std::cerr << "  Run 1: " << cpu_score << std::endl;
         std::cerr << "  Run 2: " << cpu_score2 << std::endl;
         return false;
+    }
+
+    // Verify expected result with default challenge (golden vector validation)
+    if (shared.instance_id == "neural_pow_test/epoch0:brandonros") {
+        constexpr int EXPECTED_LZ_BITS = 27;
+        if (cpu_bits != EXPECTED_LZ_BITS) {
+            std::cerr << "FATAL: Golden vector mismatch!" << std::endl;
+            std::cerr << "  Expected: " << EXPECTED_LZ_BITS << " leading zero bits" << std::endl;
+            std::cerr << "  Got: " << cpu_bits << " leading zero bits" << std::endl;
+            std::cerr << "  This indicates a determinism bug in the verifier." << std::endl;
+            return false;
+        }
+        std::cout << "[Test] Golden vector PASSED (27 LZ bits verified)" << std::endl;
     }
 
     // Verify lrintf behaves correctly for edge cases
