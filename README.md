@@ -48,14 +48,14 @@ Options:
 ## Verifying a proof
 
 ```bash
-# Mined proofs use base64-encoded random bytes
-./output/neurallenge --verify "brandonros/ABC123xyz789+/=="
+# Real example (22 bits):
+./output/neurallenge --verify "brandonros//okcqJqhGz46ri7Z"
+# Digest: 00000|28ff4e8e72bf55ce581eb5e24470208380eb1d3d7f349b1734e8b5a4e87
+# Result: 22 bits
 
-# But ANY string works as a nonce - be creative!
+# ANY string works as a nonce - be creative!
 ./output/neurallenge --verify "brandonros/hello world"
 ./output/neurallenge --verify "alice/my clever message here"
 ```
 
-Output shows the digest and leading zero bits.
-
-Nonces can be any string - short, long, whatever you want. The miner outputs base64-encoded random bytes, but you can submit any string for verification.
+Nonces can be any string - short, long, whatever you want.
