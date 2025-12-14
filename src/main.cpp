@@ -78,11 +78,22 @@ inline float get_weight(const int8_t* weights, size_t idx) {
     return static_cast<float>(weights[idx]) * WEIGHT_SCALE;
 }
 
-void nonce_to_input(const uint8_t* nonce, float* input) {
+// Forward declaration - expand_nonce is implemented after sha256 namespace
+void expand_nonce(const uint8_t* nonce, size_t nonce_len, uint8_t* expanded);
+
+// Convert 64 expanded bytes to INPUT_DIM floats
+void expanded_to_input(const uint8_t* expanded, float* input) {
     for (int i = 0; i < INPUT_DIM; i++) {
-        int16_t val = static_cast<int16_t>(nonce[i*2] | (nonce[i*2 + 1] << 8));
+        int16_t val = static_cast<int16_t>(expanded[i*2] | (expanded[i*2 + 1] << 8));
         input[i] = q16(static_cast<float>(val) * INPUT_SCALE);
     }
+}
+
+// Full nonce-to-input: any nonce -> SHA256 expand -> 32 floats
+void nonce_to_input(const uint8_t* nonce, size_t nonce_len, float* input) {
+    uint8_t expanded[64];
+    expand_nonce(nonce, nonce_len, expanded);
+    expanded_to_input(expanded, input);
 }
 
 float matmul_row(const int8_t* W, const int8_t* bias, const float* input, size_t in_dim) {
@@ -249,14 +260,14 @@ int score_to_lz_bits(uint64_t score) {
     return bits;
 }
 
-// Forward pass - computes network output from nonce
-void forward_pass(const int8_t* weights, const uint8_t* nonce, float* output) {
+// Forward pass - computes network output from nonce (any length)
+void forward_pass(const int8_t* weights, const uint8_t* nonce, size_t nonce_len, float* output) {
     float input[INPUT_DIM];
     float hidden1[HIDDEN_DIM];
     float hidden2[HIDDEN_DIM];
     float hidden3[HIDDEN_DIM];
 
-    nonce_to_input(nonce, input);
+    nonce_to_input(nonce, nonce_len, input);
 
     layer_forward(weights + W1_OFFSET, weights + B1_OFFSET,
                   input, hidden1, INPUT_DIM, HIDDEN_DIM, true);
@@ -269,9 +280,9 @@ void forward_pass(const int8_t* weights, const uint8_t* nonce, float* output) {
 }
 
 // Full forward pass - returns score (lower = better)
-uint64_t forward(const int8_t* weights, const uint8_t* nonce) {
+uint64_t forward(const int8_t* weights, const uint8_t* nonce, size_t nonce_len) {
     float output[OUTPUT_DIM];
-    forward_pass(weights, nonce, output);
+    forward_pass(weights, nonce, nonce_len, output);
     return compute_score(output, OUTPUT_DIM);
 }
 
@@ -361,6 +372,22 @@ void hash(const uint8_t* data, size_t len, uint8_t* out) {
 }
 
 } // namespace sha256
+
+// Implementation of expand_nonce for cpu_verifier (uses sha256::hash from above)
+namespace cpu_verifier {
+void expand_nonce(const uint8_t* nonce, size_t nonce_len, uint8_t* expanded) {
+    std::vector<uint8_t> buf(nonce_len + 1);
+    std::memcpy(buf.data(), nonce, nonce_len);
+
+    // First half: SHA256(nonce || 0x00)
+    buf[nonce_len] = 0x00;
+    sha256::hash(buf.data(), buf.size(), expanded);
+
+    // Second half: SHA256(nonce || 0x01)
+    buf[nonce_len] = 0x01;
+    sha256::hash(buf.data(), buf.size(), expanded + 32);
+}
+} // namespace cpu_verifier
 
 void append_u32(std::vector<uint8_t>& data, uint32_t value) {
     for (int i = 0; i < 4; i++) {
@@ -697,7 +724,7 @@ void gpu_worker_thread(GPUContext& ctx, SharedState& shared) {
             uint8_t* batch_best_nonce = all_nonces.data() + best_idx * NONCE_BYTES;
 
             // Verify on CPU - must match bit-exactly (consensus requirement)
-            uint64_t cpu_score = cpu_verifier::forward(shared.weights.data(), batch_best_nonce);
+            uint64_t cpu_score = cpu_verifier::forward(shared.weights.data(), batch_best_nonce, NONCE_BYTES);
 
             // Scores must match exactly - any difference is a determinism bug
             if (cpu_score != batch_best_score) {
@@ -711,7 +738,7 @@ void gpu_worker_thread(GPUContext& ctx, SharedState& shared) {
                 std::lock_guard<std::mutex> lock(shared.best_mutex);
                 if (cpu_score < shared.best_score) {
                     float outputs[OUTPUT_DIM];
-                    cpu_verifier::forward_pass(shared.weights.data(), batch_best_nonce, outputs);
+                    cpu_verifier::forward_pass(shared.weights.data(), batch_best_nonce, NONCE_BYTES, outputs);
                     uint8_t digest[DIGEST_BYTES];
                     cpu_verifier::compute_digest(outputs, digest, OUTPUT_DIM);
                     int lz_bits = cpu_verifier::count_leading_zero_bits(digest, DIGEST_BYTES);
@@ -785,15 +812,15 @@ bool run_determinism_test(const SharedState& shared) {
     }
 
     // CPU computation
-    uint64_t cpu_score = cpu_verifier::forward(shared.weights.data(), test_nonce);
+    uint64_t cpu_score = cpu_verifier::forward(shared.weights.data(), test_nonce, NONCE_BYTES);
     float cpu_outputs[OUTPUT_DIM];
-    cpu_verifier::forward_pass(shared.weights.data(), test_nonce, cpu_outputs);
+    cpu_verifier::forward_pass(shared.weights.data(), test_nonce, NONCE_BYTES, cpu_outputs);
     uint8_t digest[DIGEST_BYTES];
     cpu_verifier::compute_digest(cpu_outputs, digest, OUTPUT_DIM);
     int cpu_bits = cpu_verifier::count_leading_zero_bits(digest, DIGEST_BYTES);
 
     // Self-consistency check: run CPU twice, must match
-    uint64_t cpu_score2 = cpu_verifier::forward(shared.weights.data(), test_nonce);
+    uint64_t cpu_score2 = cpu_verifier::forward(shared.weights.data(), test_nonce, NONCE_BYTES);
     if (cpu_score != cpu_score2) {
         std::cerr << "FATAL: CPU verifier is not deterministic!" << std::endl;
         std::cerr << "  Run 1: 0x" << std::hex << cpu_score << std::endl;
@@ -926,29 +953,30 @@ int main(int argc, char* argv[]) {
 
     // Verify mode: parse proof, verify, and exit
     if (!verify_proof.empty()) {
-        // Parse proof: username/nonce_base64
+        // Parse proof: username/nonce (nonce can be ANY string)
         size_t slash_pos = verify_proof.find('/');
         if (slash_pos == std::string::npos) {
-            std::cerr << "Invalid proof format. Expected: username/nonce_base64" << std::endl;
+            std::cerr << "Invalid proof format. Expected: username/nonce" << std::endl;
             return 1;
         }
         std::string proof_username = verify_proof.substr(0, slash_pos);
-        std::string nonce_b64 = verify_proof.substr(slash_pos + 1);
+        std::string nonce_str = verify_proof.substr(slash_pos + 1);
 
-        std::vector<uint8_t> nonce;
-        if (!base64_to_bytes(nonce_b64, nonce) || nonce.size() != NONCE_BYTES) {
-            std::cerr << "Invalid nonce: expected " << NONCE_BYTES << " bytes (base64), got "
-                      << nonce.size() << std::endl;
+        if (nonce_str.empty()) {
+            std::cerr << "Nonce cannot be empty" << std::endl;
             return 1;
         }
+
+        // Treat nonce as raw bytes (any string works!)
+        std::vector<uint8_t> nonce(nonce_str.begin(), nonce_str.end());
 
         // Generate weights
         std::vector<int8_t> weights;
         generate_weights(WEIGHT_EPOCH, weights);
 
-        // Run forward pass
+        // Run forward pass (nonce gets SHA-256 expanded to 64 bytes internally)
         float outputs[OUTPUT_DIM];
-        cpu_verifier::forward_pass(weights.data(), nonce.data(), outputs);
+        cpu_verifier::forward_pass(weights.data(), nonce.data(), nonce.size(), outputs);
         uint8_t digest[DIGEST_BYTES];
         cpu_verifier::compute_digest(outputs, digest, OUTPUT_DIM);
         int lz_bits = cpu_verifier::count_leading_zero_bits(digest, DIGEST_BYTES);
@@ -957,7 +985,7 @@ int main(int argc, char* argv[]) {
         std::cout << "Proof Verification" << std::endl;
         std::cout << "==================" << std::endl;
         std::cout << "Username: " << proof_username << std::endl;
-        std::cout << "Nonce: " << nonce_b64 << std::endl;
+        std::cout << "Nonce: " << nonce_str << " (" << nonce_str.size() << " bytes)" << std::endl;
         std::cout << "Digest: " << format_digest_with_marker(digest_hex, lz_bits) << std::endl;
         std::cout << "Result: " << describe_lz_bits(lz_bits) << std::endl;
         return 0;
@@ -1096,12 +1124,12 @@ int main(int argc, char* argv[]) {
 
     if (!shared.best_nonce.empty()) {
         float outputs[OUTPUT_DIM];
-        cpu_verifier::forward_pass(shared.weights.data(), shared.best_nonce.data(), outputs);
+        cpu_verifier::forward_pass(shared.weights.data(), shared.best_nonce.data(), shared.best_nonce.size(), outputs);
         uint8_t digest[DIGEST_BYTES];
         cpu_verifier::compute_digest(outputs, digest, OUTPUT_DIM);
         int lz_bits = cpu_verifier::count_leading_zero_bits(digest, DIGEST_BYTES);
         std::string digest_hex = bytes_to_hex(digest, DIGEST_BYTES);
-        std::string nonce_b64 = bytes_to_base64(shared.best_nonce.data(), NONCE_BYTES);
+        std::string nonce_b64 = bytes_to_base64(shared.best_nonce.data(), shared.best_nonce.size());
 
         std::cout << "\nBest Result: " << describe_lz_bits(lz_bits) << std::endl;
         std::cout << "Digest: " << format_digest_with_marker(digest_hex, lz_bits) << std::endl;

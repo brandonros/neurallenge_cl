@@ -12,8 +12,9 @@
 // Digest size
 #define DIGEST_BYTES OUTPUT_DIM
 
-// Nonce size (bytes) - converted to INPUT_DIM floats
-#define NONCE_BYTES (INPUT_DIM * 2)
+// Nonce size for kernel mining (bytes) - gets SHA-256 expanded to 64 bytes
+// 16 bytes = 22 base64 chars, provides plenty of entropy
+#define NONCE_BYTES 16
 
 // Serialized output size for hashing
 #define SERIALIZED_OUTPUT_BYTES (OUTPUT_DIM * 4)

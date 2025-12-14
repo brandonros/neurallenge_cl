@@ -103,15 +103,124 @@ inline void layer_forward(
 }
 
 // ============================================================================
-// Nonce to Input Conversion
+// SHA-256 for nonce expansion (any string -> 64 bytes)
 // ============================================================================
 
-inline void nonce_to_input(const uchar* nonce, float* input) {
+__constant uint SHA256_K[64] = {
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+};
+
+#define SHA_CH(x, y, z)    bitselect((z), (y), (x))
+#define SHA_MAJ(x, y, z)   (((x) & (y)) ^ ((x) & (z)) ^ ((y) & (z)))
+#define SHA_BSIG0(x)       (rotate((x), 30u) ^ rotate((x), 19u) ^ rotate((x), 10u))
+#define SHA_BSIG1(x)       (rotate((x), 26u) ^ rotate((x), 21u) ^ rotate((x), 7u))
+#define SHA_SSIG0(x)       (rotate((x), 25u) ^ rotate((x), 14u) ^ ((x) >> 3))
+#define SHA_SSIG1(x)       (rotate((x), 15u) ^ rotate((x), 13u) ^ ((x) >> 10))
+
+// SHA-256 for short inputs (up to 55 bytes, fits in one block with padding)
+// Output: 32 bytes
+inline void sha256_short(const uchar* data, uint len, uchar* out) {
+    uint w[16];
+
+    // Clear w
+    for (int i = 0; i < 16; i++) w[i] = 0;
+
+    // Copy data (big-endian)
+    for (uint i = 0; i < len; i++) {
+        w[i >> 2] |= ((uint)data[i]) << (24 - 8 * (i & 3));
+    }
+
+    // Append 1 bit
+    w[len >> 2] |= 0x80u << (24 - 8 * (len & 3));
+
+    // Append length in bits (big-endian, len < 56 so fits in w[15])
+    w[15] = len * 8;
+
+    // Initial hash values
+    uint H[8] = {
+        0x6a09e667u, 0xbb67ae85u, 0x3c6ef372u, 0xa54ff53au,
+        0x510e527fu, 0x9b05688cu, 0x1f83d9abu, 0x5be0cd19u
+    };
+
+    uint a = H[0], b = H[1], c = H[2], d = H[3];
+    uint e = H[4], f = H[5], g = H[6], h = H[7];
+
+    // Rounds 0-15
+    for (int i = 0; i < 16; i++) {
+        uint t1 = h + SHA_BSIG1(e) + SHA_CH(e, f, g) + SHA256_K[i] + w[i];
+        uint t2 = SHA_BSIG0(a) + SHA_MAJ(a, b, c);
+        h = g; g = f; f = e; e = d + t1;
+        d = c; c = b; b = a; a = t1 + t2;
+    }
+
+    // Rounds 16-63
+    for (int i = 16; i < 64; i++) {
+        int j = i & 0xF;
+        w[j] = SHA_SSIG1(w[(j + 14) & 0xF]) + w[(j + 9) & 0xF] +
+               SHA_SSIG0(w[(j + 1) & 0xF]) + w[j];
+        uint t1 = h + SHA_BSIG1(e) + SHA_CH(e, f, g) + SHA256_K[i] + w[j];
+        uint t2 = SHA_BSIG0(a) + SHA_MAJ(a, b, c);
+        h = g; g = f; f = e; e = d + t1;
+        d = c; c = b; b = a; a = t1 + t2;
+    }
+
+    // Final hash
+    H[0] += a; H[1] += b; H[2] += c; H[3] += d;
+    H[4] += e; H[5] += f; H[6] += g; H[7] += h;
+
+    // Output (big-endian)
+    for (int i = 0; i < 8; i++) {
+        out[i*4]     = (H[i] >> 24) & 0xFF;
+        out[i*4 + 1] = (H[i] >> 16) & 0xFF;
+        out[i*4 + 2] = (H[i] >> 8) & 0xFF;
+        out[i*4 + 3] = H[i] & 0xFF;
+    }
+}
+
+// Expand nonce to 64 bytes using SHA-256
+// expanded = SHA256(nonce || 0x00) || SHA256(nonce || 0x01)
+inline void expand_nonce(const uchar* nonce, uint nonce_len, uchar* expanded) {
+    uchar buf[NONCE_BYTES + 1];
+
+    // Copy nonce and append suffix byte
+    for (uint i = 0; i < nonce_len; i++) {
+        buf[i] = nonce[i];
+    }
+
+    // First half: SHA256(nonce || 0x00)
+    buf[nonce_len] = 0x00;
+    sha256_short(buf, nonce_len + 1, expanded);
+
+    // Second half: SHA256(nonce || 0x01)
+    buf[nonce_len] = 0x01;
+    sha256_short(buf, nonce_len + 1, expanded + 32);
+}
+
+// ============================================================================
+// Nonce to Input Conversion (via SHA-256 expansion)
+// ============================================================================
+
+// Convert 64 expanded bytes to INPUT_DIM floats
+inline void expanded_to_input(const uchar* expanded, float* input) {
     for (int i = 0; i < INPUT_DIM; i++) {
         // Little-endian int16
-        short val = (short)(nonce[i*2] | (nonce[i*2 + 1] << 8));
+        short val = (short)(expanded[i*2] | (expanded[i*2 + 1] << 8));
         input[i] = q16((float)val * INPUT_SCALE);
     }
+}
+
+// Full nonce-to-input: any nonce -> SHA256 expand -> 32 floats
+inline void nonce_to_input(const uchar* nonce, uint nonce_len, float* input) {
+    uchar expanded[64];
+    expand_nonce(nonce, nonce_len, expanded);
+    expanded_to_input(expanded, input);
 }
 
 // ============================================================================
@@ -293,8 +402,8 @@ __kernel void neural_pow_mine(
         // Generate random nonce
         generate_nonce(&s0, &s1, nonce);
 
-        // Convert nonce to input
-        nonce_to_input(nonce, input);
+        // Convert nonce to input (hash expansion)
+        nonce_to_input(nonce, NONCE_BYTES, input);
 
         // Forward pass
         // Layer 1: 32 -> 256, ReLU

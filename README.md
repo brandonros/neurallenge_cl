@@ -9,11 +9,12 @@ Like Shallenge, but with a neural network in the middle:
 1. **Epoch string → SHA-256 → ~148KB of neural network weights**
    Everyone mines the same network for a fair leaderboard.
 
-2. **Random nonce → neural network → 32 output values**
+2. **Nonce → SHA-256 expand to 64 bytes → neural network → 32 output values**
+   Any string works as a nonce! It gets SHA-256 expanded to 64 bytes before the network.
    The network has 4 layers (32→256→256→256→32) of FP32 multiply-adds.
 
 3. **Output → SipHash-2-4 → 32-byte digest → count leading zero bits**
-   More zeros = better proof. Format: `username/nonce`.
+   More zeros = better proof. Format: `username/nonce` where nonce can be any string.
 
 ## vs Shallenge
 
@@ -47,9 +48,14 @@ Options:
 ## Verifying a proof
 
 ```bash
-./output/neurallenge --verify "brandonros/GAehbrFwu9v3s5u2b4n0L8C8m7E2g7B3x5C4D6F7H8J9K0M1N2P3Q4R5S6T7U8V9W0=="
+# Mined proofs use base64-encoded random bytes
+./output/neurallenge --verify "brandonros/ABC123xyz789+/=="
+
+# But ANY string works as a nonce - be creative!
+./output/neurallenge --verify "brandonros/hello world"
+./output/neurallenge --verify "alice/my clever message here"
 ```
 
 Output shows the digest and leading zero bits.
 
-Nonces are base64-encoded (86 characters for 64 bytes).
+Nonces can be any string - short, long, whatever you want. The miner outputs base64-encoded random bytes, but you can submit any string for verification.
