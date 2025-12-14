@@ -633,7 +633,7 @@ bool create_gpu_context(cl_device_id device, int device_index, const SharedState
     }
 
     ctx.found_count_buf = clCreateBuffer(ctx.context, CL_MEM_READ_WRITE, sizeof(cl_uint), nullptr, &err);
-    ctx.found_scores_buf = clCreateBuffer(ctx.context, CL_MEM_WRITE_ONLY, MAX_RESULTS * sizeof(cl_long), nullptr, &err);
+    ctx.found_scores_buf = clCreateBuffer(ctx.context, CL_MEM_WRITE_ONLY, MAX_RESULTS * sizeof(cl_ulong), nullptr, &err);
     ctx.found_nonces_buf = clCreateBuffer(ctx.context, CL_MEM_WRITE_ONLY, MAX_RESULTS * NONCE_BYTES, nullptr, &err);
 
     if (err != CL_SUCCESS) {
