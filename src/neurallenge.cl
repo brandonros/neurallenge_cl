@@ -98,7 +98,7 @@ inline void layer_forward(
 // ============================================================================
 
 inline void nonce_to_input(const uchar* nonce, float* input) {
-    for (int i = 0; i < 32; i++) {
+    for (int i = 0; i < INPUT_DIM; i++) {
         // Little-endian int16
         short val = (short)(nonce[i*2] | (nonce[i*2 + 1] << 8));
         input[i] = q16((float)val * (1.0f / 32768.0f));
@@ -133,7 +133,8 @@ inline uint xoroshiro64_next(uint* s0, uint* s1) {
 }
 
 inline void generate_nonce(uint* s0, uint* s1, uchar* nonce) {
-    for (int i = 0; i < 16; i++) {
+    // Generate NONCE_BYTES using 32-bit RNG outputs (4 bytes each)
+    for (int i = 0; i < (NONCE_BYTES / 4); i++) {
         uint r = xoroshiro64_next(s0, s1);
         nonce[i*4 + 0] = (r >> 0) & 0xFF;
         nonce[i*4 + 1] = (r >> 8) & 0xFF;

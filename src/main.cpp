@@ -77,7 +77,7 @@ inline float get_weight(const int8_t* weights, size_t idx) {
 }
 
 void nonce_to_input(const uint8_t* nonce, float* input) {
-    for (int i = 0; i < 32; i++) {
+    for (int i = 0; i < INPUT_DIM; i++) {
         int16_t val = static_cast<int16_t>(nonce[i*2] | (nonce[i*2 + 1] << 8));
         input[i] = q16(static_cast<float>(val) * (1.0f / 32768.0f));
     }
@@ -130,18 +130,17 @@ inline void sipround(uint64_t& v0, uint64_t& v1, uint64_t& v2, uint64_t& v3) {
     v2 += v1; v1 = rotl64(v1, 17); v1 ^= v2; v2 = rotl64(v2, 32);
 }
 
-// SipHash-2-4 with 128-bit key, returns 64-bit hash
-uint64_t siphash_2_4(const uint8_t* data, size_t len, uint64_t k0, uint64_t k1) {
+// SipHash-2-4 specialized for SIPHASH_INPUT_BYTES (132 bytes)
+// Matches kernel's siphash_2_4_132 exactly to avoid divergence
+uint64_t siphash_2_4_132(const uint8_t* data, uint64_t k0, uint64_t k1) {
     uint64_t v0 = k0 ^ 0x736f6d6570736575ULL;
     uint64_t v1 = k1 ^ 0x646f72616e646f6dULL;
     uint64_t v2 = k0 ^ 0x6c7967656e657261ULL;
     uint64_t v3 = k1 ^ 0x7465646279746573ULL;
 
-    const uint8_t* end = data + (len & ~7ULL);
-    const uint8_t* p = data;
-
-    // Process 8-byte blocks
-    while (p < end) {
+    // Process 16 full 8-byte blocks (128 bytes)
+    for (int blk = 0; blk < 16; blk++) {
+        const uint8_t* p = data + blk * 8;
         uint64_t m = static_cast<uint64_t>(p[0])
                    | (static_cast<uint64_t>(p[1]) << 8)
                    | (static_cast<uint64_t>(p[2]) << 16)
@@ -154,21 +153,15 @@ uint64_t siphash_2_4(const uint8_t* data, size_t len, uint64_t k0, uint64_t k1) 
         sipround(v0, v1, v2, v3);
         sipround(v0, v1, v2, v3);
         v0 ^= m;
-        p += 8;
     }
 
-    // Process remaining bytes + length
-    uint64_t b = static_cast<uint64_t>(len) << 56;
-    switch (len & 7) {
-        case 7: b |= static_cast<uint64_t>(p[6]) << 48; [[fallthrough]];
-        case 6: b |= static_cast<uint64_t>(p[5]) << 40; [[fallthrough]];
-        case 5: b |= static_cast<uint64_t>(p[4]) << 32; [[fallthrough]];
-        case 4: b |= static_cast<uint64_t>(p[3]) << 24; [[fallthrough]];
-        case 3: b |= static_cast<uint64_t>(p[2]) << 16; [[fallthrough]];
-        case 2: b |= static_cast<uint64_t>(p[1]) << 8;  [[fallthrough]];
-        case 1: b |= static_cast<uint64_t>(p[0]);       break;
-        case 0: break;
-    }
+    // Process final 4 bytes + length (132 = 0x84)
+    const uint8_t* p = data + 128;
+    uint64_t b = (132ULL << 56)
+               | static_cast<uint64_t>(p[0])
+               | (static_cast<uint64_t>(p[1]) << 8)
+               | (static_cast<uint64_t>(p[2]) << 16)
+               | (static_cast<uint64_t>(p[3]) << 24);
 
     v3 ^= b;
     sipround(v0, v1, v2, v3);
@@ -205,7 +198,7 @@ void compute_digest(const float* output, uint8_t* digest, size_t dim) {
     // Generate DIGEST_BYTES of digest using SipHash with domain separation
     for (size_t block = 0; block < (DIGEST_BYTES / 8); block++) {
         input[SERIALIZED_OUTPUT_BYTES] = static_cast<uint8_t>(block);
-        uint64_t h = siphash_2_4(input, SIPHASH_INPUT_BYTES, SIPHASH_K0, SIPHASH_K1);
+        uint64_t h = siphash_2_4_132(input, SIPHASH_K0, SIPHASH_K1);
 
         // Extract 8 bytes from hash (little-endian)
         for (int i = 0; i < 8; i++) {
@@ -256,8 +249,8 @@ int score_to_leading_zero_bits(int64_t score) {
     return static_cast<int>(((-score) + ((1LL << SCORE_SHIFT) - 1)) >> SCORE_SHIFT);
 }
 
-// Get raw outputs for display
-void get_outputs(const int8_t* weights, const uint8_t* nonce, float* out) {
+// Forward pass - computes network output from nonce
+void forward_pass(const int8_t* weights, const uint8_t* nonce, float* output) {
     float input[INPUT_DIM];
     float hidden1[HIDDEN_DIM];
     float hidden2[HIDDEN_DIM];
@@ -272,43 +265,18 @@ void get_outputs(const int8_t* weights, const uint8_t* nonce, float* out) {
     layer_forward(weights + W3_OFFSET, weights + B3_OFFSET,
                   hidden2, hidden3, HIDDEN_DIM, HIDDEN_DIM, true);
     layer_forward(weights + W4_OFFSET, weights + B4_OFFSET,
-                  hidden3, out, HIDDEN_DIM, OUTPUT_DIM, false);
+                  hidden3, output, HIDDEN_DIM, OUTPUT_DIM, false);
+}
+
+// Get raw outputs for display (alias for forward_pass)
+void get_outputs(const int8_t* weights, const uint8_t* nonce, float* out) {
+    forward_pass(weights, nonce, out);
 }
 
 // Full forward pass - returns integer score
 int64_t forward(const int8_t* weights, const uint8_t* nonce) {
-    float input[INPUT_DIM];
-    float hidden1[HIDDEN_DIM];
-    float hidden2[HIDDEN_DIM];
-    float hidden3[HIDDEN_DIM];
     float output[OUTPUT_DIM];
-
-    nonce_to_input(nonce, input);
-
-    layer_forward(
-        weights + W1_OFFSET, weights + B1_OFFSET,
-        input, hidden1,
-        INPUT_DIM, HIDDEN_DIM, true
-    );
-
-    layer_forward(
-        weights + W2_OFFSET, weights + B2_OFFSET,
-        hidden1, hidden2,
-        HIDDEN_DIM, HIDDEN_DIM, true
-    );
-
-    layer_forward(
-        weights + W3_OFFSET, weights + B3_OFFSET,
-        hidden2, hidden3,
-        HIDDEN_DIM, HIDDEN_DIM, true
-    );
-
-    layer_forward(
-        weights + W4_OFFSET, weights + B4_OFFSET,
-        hidden3, output,
-        HIDDEN_DIM, OUTPUT_DIM, false
-    );
-
+    forward_pass(weights, nonce, output);
     return compute_score_int(output, OUTPUT_DIM);
 }
 
@@ -1036,6 +1004,7 @@ int main(int argc, char* argv[]) {
 
     uint64_t last_total = 0;
     auto last_time = std::chrono::steady_clock::now();
+    int stats_tick = 0;
 
     while (shared.running.load()) {
         std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -1046,9 +1015,9 @@ int main(int argc, char* argv[]) {
             break;
         }
 
-        static int tick = 0;
-        if (++tick < 5) continue;
-        tick = 0;
+        // Only update stats display every 5 seconds
+        if (++stats_tick < 5) continue;
+        stats_tick = 0;
 
         uint64_t total_evals = 0;
         uint64_t total_matches = 0;
