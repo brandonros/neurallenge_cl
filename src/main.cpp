@@ -44,9 +44,6 @@
 #define STRINGIFY_(x) #x
 #define STRINGIFY(x) STRINGIFY_(x)
 
-// Static assertions for config sanity
-static_assert(DIGEST_PREFIX_BYTES <= DIGEST_BYTES, "Digest prefix larger than digest");
-static_assert((DIGEST_PREFIX_BYTES * 8) <= SCORE_SHIFT, "Score shift too small for digest prefix");
 
 // ============================================================================
 // CPU Verifier - MUST match GPU exactly
@@ -232,27 +229,25 @@ int count_leading_zero_bits(const uint8_t* digest, size_t len) {
     return bits;
 }
 
-uint64_t digest_prefix_value(const uint8_t* digest) {
-    uint64_t val = 0;
-    for (size_t i = 0; i < DIGEST_PREFIX_BYTES; i++) {
-        val = (val << 8) | static_cast<uint64_t>(digest[i]);
-    }
-    return val;
-}
-
-// Integer score computation using digest leading zeros
-// Score = -(leading_zero_bits << SCORE_SHIFT) + digest_prefix
-int64_t compute_score_int(const float* output, size_t dim) {
+// Score = first 8 bytes of digest as big-endian uint64 (lower = better)
+uint64_t compute_score(const float* output, size_t dim) {
     uint8_t digest[DIGEST_BYTES];
     compute_digest(output, digest, dim);
-    int lz_bits = count_leading_zero_bits(digest, DIGEST_BYTES);
-    uint64_t prefix = digest_prefix_value(digest);
-    return -(static_cast<int64_t>(lz_bits) << SCORE_SHIFT) + static_cast<int64_t>(prefix);
+    return (static_cast<uint64_t>(digest[0]) << 56) | (static_cast<uint64_t>(digest[1]) << 48) |
+           (static_cast<uint64_t>(digest[2]) << 40) | (static_cast<uint64_t>(digest[3]) << 32) |
+           (static_cast<uint64_t>(digest[4]) << 24) | (static_cast<uint64_t>(digest[5]) << 16) |
+           (static_cast<uint64_t>(digest[6]) << 8)  | static_cast<uint64_t>(digest[7]);
 }
 
-int score_to_leading_zero_bits(int64_t score) {
-    if (score >= 0) return 0;
-    return static_cast<int>(((-score) + ((1LL << SCORE_SHIFT) - 1)) >> SCORE_SHIFT);
+// Convert score to leading zero bits (for display)
+int score_to_lz_bits(uint64_t score) {
+    if (score == 0) return 64;
+    int bits = 0;
+    while ((score & (1ULL << 63)) == 0) {
+        bits++;
+        score <<= 1;
+    }
+    return bits;
 }
 
 // Forward pass - computes network output from nonce
@@ -274,11 +269,11 @@ void forward_pass(const int8_t* weights, const uint8_t* nonce, float* output) {
                   hidden3, output, HIDDEN_DIM, OUTPUT_DIM, false);
 }
 
-// Full forward pass - returns integer score
-int64_t forward(const int8_t* weights, const uint8_t* nonce) {
+// Full forward pass - returns score (lower = better)
+uint64_t forward(const int8_t* weights, const uint8_t* nonce) {
     float output[OUTPUT_DIM];
     forward_pass(weights, nonce, output);
-    return compute_score_int(output, OUTPUT_DIM);
+    return compute_score(output, OUTPUT_DIM);
 }
 
 } // namespace cpu_verifier
@@ -404,7 +399,7 @@ void generate_weights(const std::string& challenge, std::vector<int8_t>& weights
 
 struct SharedState {
     std::mutex best_mutex;
-    int64_t best_score;
+    uint64_t best_score;  // First 8 bytes of digest (lower = better)
     std::vector<uint8_t> best_nonce;
     std::vector<uint8_t> best_digest;
     std::atomic<bool> running{true};
@@ -601,7 +596,7 @@ void gpu_worker_thread(GPUContext& ctx, SharedState& shared) {
     std::mt19937 rng(rd());
 
     while (shared.running.load()) {
-        cl_long target_score;
+        cl_ulong target_score;
         {
             std::lock_guard<std::mutex> lock(shared.best_mutex);
             target_score = shared.best_score;
@@ -614,7 +609,7 @@ void gpu_worker_thread(GPUContext& ctx, SharedState& shared) {
         cl_uint zero = 0;
         clEnqueueWriteBuffer(ctx.queue, ctx.found_count_buf, CL_FALSE, 0, sizeof(cl_uint), &zero, 0, nullptr, nullptr);
 
-        clSetKernelArg(ctx.kernel, 1, sizeof(cl_long), &target_score);
+        clSetKernelArg(ctx.kernel, 1, sizeof(cl_ulong), &target_score);
         clSetKernelArg(ctx.kernel, 2, sizeof(cl_uint), &seed_lo);
         clSetKernelArg(ctx.kernel, 3, sizeof(cl_uint), &seed_hi);
 
@@ -640,15 +635,15 @@ void gpu_worker_thread(GPUContext& ctx, SharedState& shared) {
         if (found_count > 0) {
             size_t results_to_read = std::min(static_cast<size_t>(found_count), static_cast<size_t>(MAX_RESULTS));
 
-            std::vector<int64_t> all_scores(results_to_read);
+            std::vector<uint64_t> all_scores(results_to_read);
             std::vector<uint8_t> all_nonces(results_to_read * NONCE_BYTES);
 
             clEnqueueReadBuffer(ctx.queue, ctx.found_scores_buf, CL_TRUE, 0,
-                               results_to_read * sizeof(int64_t), all_scores.data(), 0, nullptr, nullptr);
+                               results_to_read * sizeof(uint64_t), all_scores.data(), 0, nullptr, nullptr);
             clEnqueueReadBuffer(ctx.queue, ctx.found_nonces_buf, CL_TRUE, 0,
                                results_to_read * NONCE_BYTES, all_nonces.data(), 0, nullptr, nullptr);
 
-            // Find best in batch
+            // Find best in batch (lowest score = best)
             size_t best_idx = 0;
             for (size_t i = 1; i < results_to_read; i++) {
                 if (all_scores[i] < all_scores[best_idx]) {
@@ -656,19 +651,17 @@ void gpu_worker_thread(GPUContext& ctx, SharedState& shared) {
                 }
             }
 
-            int64_t batch_best_score = all_scores[best_idx];
+            uint64_t batch_best_score = all_scores[best_idx];
             uint8_t* batch_best_nonce = all_nonces.data() + best_idx * NONCE_BYTES;
 
             // Verify on CPU - must match bit-exactly (consensus requirement)
-            int64_t cpu_score = cpu_verifier::forward(shared.weights.data(), batch_best_nonce);
+            uint64_t cpu_score = cpu_verifier::forward(shared.weights.data(), batch_best_nonce);
 
             // Scores must match exactly - any difference is a determinism bug
             if (cpu_score != batch_best_score) {
-                int gpu_zeros = cpu_verifier::score_to_leading_zero_bits(batch_best_score);
-                int cpu_zeros = cpu_verifier::score_to_leading_zero_bits(cpu_score);
                 std::cerr << "[GPU " << ctx.device_index << "] CRITICAL: Score mismatch! "
-                          << "GPU=" << batch_best_score << " (" << gpu_zeros << " LZ bits) "
-                          << "CPU=" << cpu_score << " (" << cpu_zeros << " LZ bits)" << std::endl;
+                          << "GPU=0x" << std::hex << batch_best_score
+                          << " CPU=0x" << cpu_score << std::dec << std::endl;
                 continue;  // Reject mismatched results
             }
 
@@ -694,8 +687,6 @@ void gpu_worker_thread(GPUContext& ctx, SharedState& shared) {
                     std::cout << "\n[GPU " << ctx.device_index << "] NEW BEST: "
                               << describe_lz_bits(lz_bits) << " | digest="
                               << format_digest_with_marker(digest_hex, lz_bits) << std::endl;
-                    std::cout << "  Prefix (first " << DIGEST_PREFIX_BYTES << " bytes): 0x"
-                              << digest_hex.substr(0, DIGEST_PREFIX_BYTES * 2) << std::endl;
                     std::cout << "  Proof: " << shared.username << "/" << nonce_hex << std::endl;
                     if (shared.verbose) {
                         std::cout << "  Output: [";
@@ -752,7 +743,7 @@ bool run_determinism_test(const SharedState& shared) {
     }
 
     // CPU computation
-    int64_t cpu_score = cpu_verifier::forward(shared.weights.data(), test_nonce);
+    uint64_t cpu_score = cpu_verifier::forward(shared.weights.data(), test_nonce);
     float cpu_outputs[OUTPUT_DIM];
     cpu_verifier::forward_pass(shared.weights.data(), test_nonce, cpu_outputs);
     uint8_t digest[DIGEST_BYTES];
@@ -760,11 +751,11 @@ bool run_determinism_test(const SharedState& shared) {
     int cpu_bits = cpu_verifier::count_leading_zero_bits(digest, DIGEST_BYTES);
 
     // Self-consistency check: run CPU twice, must match
-    int64_t cpu_score2 = cpu_verifier::forward(shared.weights.data(), test_nonce);
+    uint64_t cpu_score2 = cpu_verifier::forward(shared.weights.data(), test_nonce);
     if (cpu_score != cpu_score2) {
         std::cerr << "FATAL: CPU verifier is not deterministic!" << std::endl;
-        std::cerr << "  Run 1: " << cpu_score << std::endl;
-        std::cerr << "  Run 2: " << cpu_score2 << std::endl;
+        std::cerr << "  Run 1: 0x" << std::hex << cpu_score << std::endl;
+        std::cerr << "  Run 2: 0x" << cpu_score2 << std::dec << std::endl;
         return false;
     }
 
@@ -879,8 +870,11 @@ int main(int argc, char* argv[]) {
     if (positional.size() > 1) {
         parse_bits_value(positional[1], 1);
     }
+
+    // Initial threshold: only report if digest has at least (target_zero_bits - 1) leading zeros
+    // Score is first 8 bytes of digest as uint64; lower = more leading zeros = better
     int base_bits = std::max(target_zero_bits - 1, 0);
-    int64_t initial_target = -(static_cast<int64_t>(base_bits) << SCORE_SHIFT);
+    uint64_t initial_target = (base_bits >= 64) ? 0 : (1ULL << (64 - base_bits));
 
     SharedState shared;
     shared.username = username;
@@ -981,7 +975,7 @@ int main(int argc, char* argv[]) {
         int current_bits = 0;
         {
             std::lock_guard<std::mutex> lock(shared.best_mutex);
-            current_bits = cpu_verifier::score_to_leading_zero_bits(shared.best_score);
+            current_bits = cpu_verifier::score_to_lz_bits(shared.best_score);
         }
 
         if (total_evals > 0) {
@@ -1019,8 +1013,6 @@ int main(int argc, char* argv[]) {
 
         std::cout << "\nBest Result: " << describe_lz_bits(lz_bits) << std::endl;
         std::cout << "Digest: " << format_digest_with_marker(digest_hex, lz_bits) << std::endl;
-        std::cout << "Prefix (first " << DIGEST_PREFIX_BYTES << " bytes): 0x"
-                  << digest_hex.substr(0, DIGEST_PREFIX_BYTES * 2) << std::endl;
         std::cout << "Proof: " << shared.username << "/" << nonce_hex << std::endl;
         if (shared.verbose) {
             std::cout << "Output: [";

@@ -250,39 +250,16 @@ inline void compute_digest(const float* output, uchar* digest, uint dim) {
     }
 }
 
-inline int count_leading_zero_bits(const uchar* digest, uint len) {
-    int bits = 0;
-    for (uint i = 0; i < len; i++) {
-        uchar b = digest[i];
-        if (b == 0) {
-            bits += 8;
-            continue;
-        }
-        int lz = 0;
-        while ((b & 0x80u) == 0) {
-            lz++;
-            b <<= 1;
-        }
-        bits += lz;
-        break;
-    }
-    return bits;
-}
-
-inline ulong digest_prefix_value(const uchar* digest) {
-    ulong val = 0;
-    for (int i = 0; i < DIGEST_PREFIX_BYTES; i++) {
-        val = (val << 8) | (ulong)digest[i];
-    }
-    return val;
-}
-
-inline long compute_score_int(const float* output, uint dim) {
+// Score = first 8 bytes of digest as big-endian uint64
+// Lower value = more leading zeros = better
+inline ulong compute_score(const float* output, uint dim) {
     uchar digest[DIGEST_BYTES];
     compute_digest(output, digest, dim);
-    int lz_bits = count_leading_zero_bits(digest, DIGEST_BYTES);
-    ulong prefix = digest_prefix_value(digest);
-    return -((long)lz_bits << SCORE_SHIFT) + (long)prefix;
+    // Big-endian: first byte is most significant
+    return ((ulong)digest[0] << 56) | ((ulong)digest[1] << 48) |
+           ((ulong)digest[2] << 40) | ((ulong)digest[3] << 32) |
+           ((ulong)digest[4] << 24) | ((ulong)digest[5] << 16) |
+           ((ulong)digest[6] << 8)  | (ulong)digest[7];
 }
 
 // ============================================================================
@@ -291,11 +268,11 @@ inline long compute_score_int(const float* output, uint dim) {
 
 __kernel void neural_pow_mine(
     __global const char* weights,
-    long target_score,               // 64-bit integer score threshold
+    ulong target_score,              // First 8 bytes of best digest (lower = better)
     uint seed_lo,
     uint seed_hi,
     FOUND_COUNT_T found_count,       // Atomic counter (CL1.2 or CL2.0+ via shim)
-    __global long* found_scores,     // 64-bit integer scores
+    __global ulong* found_scores,    // First 8 bytes of digest
     __global uchar* found_nonces
 ) {
     uint thread_idx = (uint)get_global_id(0);
@@ -348,10 +325,10 @@ __kernel void neural_pow_mine(
             HIDDEN_DIM, OUTPUT_DIM, 0
         );
 
-        // Compute integer score (fully deterministic)
-        long score = compute_score_int(output, OUTPUT_DIM);
+        // Compute score (first 8 bytes of digest as uint64)
+        ulong score = compute_score(output, OUTPUT_DIM);
 
-        // Check target
+        // Check target (lower = better)
         if (score < target_score) {
             uint slot = reserve_slot(found_count);
 

@@ -9,10 +9,8 @@
 #define HIDDEN_DIM 256
 #define OUTPUT_DIM 32
 
-// Digest/scoring
+// Digest size
 #define DIGEST_BYTES OUTPUT_DIM
-#define DIGEST_PREFIX_BYTES 6
-#define SCORE_SHIFT 48
 
 // Nonce size (bytes) - converted to INPUT_DIM floats
 #define NONCE_BYTES (INPUT_DIM * 2)
