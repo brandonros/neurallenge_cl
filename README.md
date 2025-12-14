@@ -41,12 +41,13 @@ Options:
   -b, --bits N             Target leading zero bits
   -x, --hex N              Target leading zero hex digits (N*4 bits)
   -v, --verbose            Show network outputs
+  -V, --verify PROOF       Verify a proof and exit
 ```
 
-## Proof format
+## Verifying a proof
 
-```
-username/nonce → digest
+```bash
+./output/neurallenge --verify "brandonros/1807944a1b9bb9d33b349f179a776784feae5a1ee7ae7fddbc0832ff733c53a0b7b3271d8ad34d63d241308cd22b9ace361f5245f88ccf76262cee7745924416"
 ```
 
-Anyone can verify by deriving weights from the epoch, running the forward pass with the nonce, and counting leading zeros in the digest.
+Output shows the digest and leading zero bits.

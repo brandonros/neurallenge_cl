@@ -33,7 +33,6 @@
 #define DEFAULT_USERNAME "anonymous"
 #endif
 
-
 #include "kernel_embedded.h"
 #include "config.h"
 
@@ -448,6 +447,17 @@ std::string describe_lz_bits(int bits) {
     return std::to_string(bits) + " bits";
 }
 
+bool hex_to_bytes(const std::string& hex, std::vector<uint8_t>& out) {
+    if (hex.size() % 2 != 0) return false;
+    out.resize(hex.size() / 2);
+    for (size_t i = 0; i < out.size(); i++) {
+        unsigned int byte;
+        if (std::sscanf(hex.c_str() + i * 2, "%2x", &byte) != 1) return false;
+        out[i] = static_cast<uint8_t>(byte);
+    }
+    return true;
+}
+
 std::string format_digest_with_marker(const std::string& hex, int lz_bits) {
     size_t nibble_pos = static_cast<size_t>(std::min<int>(lz_bits / 4, static_cast<int>(hex.size())));
     std::string marked = hex;
@@ -776,6 +786,7 @@ int main(int argc, char* argv[]) {
     setup_fp_environment();
 
     std::string username = DEFAULT_USERNAME;
+    std::string verify_proof;
     int target_zero_bits = 16;
     bool verbose = false;
 
@@ -783,6 +794,7 @@ int main(int argc, char* argv[]) {
     constexpr size_t USER_PREFIX_LEN = sizeof("--user=") - 1;
     constexpr size_t BITS_PREFIX_LEN = sizeof("--bits=") - 1;
     constexpr size_t HEX_PREFIX_LEN = sizeof("--hex=") - 1;
+    constexpr size_t VERIFY_PREFIX_LEN = sizeof("--verify=") - 1;
 
     auto parse_bits_value = [&](const std::string& value, int multiplier) {
         try {
@@ -838,6 +850,15 @@ int main(int argc, char* argv[]) {
             continue;
         }
 
+        if (arg == "--verify" || arg == "-V") {
+            verify_proof = require_next_arg();
+            continue;
+        }
+        if (arg.rfind("--verify=", 0) == 0) {
+            verify_proof = arg.substr(VERIFY_PREFIX_LEN);
+            continue;
+        }
+
         if (!arg.empty() && arg[0] == '-') {
             std::cerr << "Unknown option: " << arg << std::endl;
             std::exit(1);
@@ -851,6 +872,45 @@ int main(int argc, char* argv[]) {
     }
     if (positional.size() > 1) {
         parse_bits_value(positional[1], 1);
+    }
+
+    // Verify mode: parse proof, verify, and exit
+    if (!verify_proof.empty()) {
+        // Parse proof: username/nonce_hex
+        size_t slash_pos = verify_proof.find('/');
+        if (slash_pos == std::string::npos) {
+            std::cerr << "Invalid proof format. Expected: username/nonce_hex" << std::endl;
+            return 1;
+        }
+        std::string proof_username = verify_proof.substr(0, slash_pos);
+        std::string nonce_hex = verify_proof.substr(slash_pos + 1);
+
+        std::vector<uint8_t> nonce;
+        if (!hex_to_bytes(nonce_hex, nonce) || nonce.size() != NONCE_BYTES) {
+            std::cerr << "Invalid nonce: expected " << NONCE_BYTES << " bytes ("
+                      << (NONCE_BYTES * 2) << " hex chars), got " << nonce.size() << std::endl;
+            return 1;
+        }
+
+        // Generate weights
+        std::vector<int8_t> weights;
+        generate_weights(WEIGHT_EPOCH, weights);
+
+        // Run forward pass
+        float outputs[OUTPUT_DIM];
+        cpu_verifier::forward_pass(weights.data(), nonce.data(), outputs);
+        uint8_t digest[DIGEST_BYTES];
+        cpu_verifier::compute_digest(outputs, digest, OUTPUT_DIM);
+        int lz_bits = cpu_verifier::count_leading_zero_bits(digest, DIGEST_BYTES);
+        std::string digest_hex = bytes_to_hex(digest, DIGEST_BYTES);
+
+        std::cout << "Proof Verification" << std::endl;
+        std::cout << "==================" << std::endl;
+        std::cout << "Username: " << proof_username << std::endl;
+        std::cout << "Nonce: " << nonce_hex << std::endl;
+        std::cout << "Digest: " << format_digest_with_marker(digest_hex, lz_bits) << std::endl;
+        std::cout << "Result: " << describe_lz_bits(lz_bits) << std::endl;
+        return 0;
     }
 
     // Initial threshold: only report if digest has at least (target_zero_bits - 1) leading zeros
