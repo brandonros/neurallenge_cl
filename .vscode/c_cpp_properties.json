@@ -1,0 +1,27 @@
+{
+    "configurations": [
+        {
+            "name": "Mac",
+            "includePath": [
+                "${workspaceFolder}/src",
+                "${workspaceFolder}/output",
+                "${workspaceFolder}/tests"
+            ],
+            "defines": [
+                "CL_TARGET_OPENCL_VERSION=300",
+                "DEFAULT_USERNAME=\"brandonros\"",
+                "GLOBAL_SIZE=1048576",
+                "LOCAL_SIZE=256",
+                "HASHES_PER_THREAD=64"
+            ],
+            "macFrameworkPath": [
+                "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/System/Library/Frameworks"
+            ],
+            "compilerPath": "/usr/bin/clang++",
+            "cStandard": "c17",
+            "cppStandard": "c++17",
+            "intelliSenseMode": "macos-clang-arm64"
+        }
+    ],
+    "version": 4
+}

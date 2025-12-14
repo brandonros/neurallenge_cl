@@ -1,0 +1,395 @@
+// Neural Proof-of-Work - OpenCL Kernel v2
+// FP32-heavy PoW with proper determinism via fixed-point semantics
+//
+// Acknowledgment: This is "float-flavored fixed-point" - the compute is FP32,
+// but determinism comes from quantizing to a fixed grid after every operation.
+
+#pragma OPENCL FP_CONTRACT OFF
+
+// ============================================================================
+// Atomic compatibility shim (OpenCL 1.2 vs 2.0+)
+// ============================================================================
+#if defined(__opencl_c_atomic_order_relaxed) && defined(__opencl_c_atomic_scope_device)
+// OpenCL 2.0+ path
+#define FOUND_COUNT_T __global atomic_uint*
+inline uint reserve_slot(FOUND_COUNT_T p) {
+    return atomic_fetch_add_explicit(p, 1u, memory_order_relaxed, memory_scope_device);
+}
+#else
+// OpenCL 1.2 path (macOS)
+#define FOUND_COUNT_T __global volatile uint*
+inline uint reserve_slot(FOUND_COUNT_T p) {
+    return atomic_inc(p);
+}
+#endif
+
+// ============================================================================
+// Quantization - Bit-exact fixed-point conversion
+// ============================================================================
+
+// Quantization using convert_int_rte (OpenCL spec-defined round-to-nearest-even)
+// This is the most deterministic option the spec provides
+inline float q16(float x) {
+    if (!isfinite(x)) x = 0.0f;
+    x = clamp(x, -32768.0f, 32767.0f);
+    int i = convert_int_rte(x * 65536.0f);
+    return (float)i * (1.0f / 65536.0f);
+}
+
+// Get the integer representation of a q16 value (for deterministic scoring)
+inline int q16_to_int(float q16_val) {
+    return convert_int_rte(q16_val * 65536.0f);
+}
+
+// ============================================================================
+// Activation Functions
+// ============================================================================
+
+inline float relu_q16(float x) {
+    return q16(fmax(0.0f, x));
+}
+
+// ============================================================================
+// Weight Access - int8 weights scaled to ~[-1, 1]
+// ============================================================================
+
+inline float get_weight(__global const char* weights, uint idx) {
+    return (float)weights[idx] * (1.0f / 127.0f);
+}
+
+// ============================================================================
+// Matrix-Vector Multiply (scalar for determinism)
+// ============================================================================
+
+// Computes one output element: dot(W[row,:], input) + bias
+inline float matmul_row(
+    __global const char* W,      // Row of weights [in_dim]
+    __global const char* bias,   // Single bias value
+    const float* input,          // [in_dim] input vector
+    uint in_dim
+) {
+    float sum = 0.0f;
+
+    for (uint i = 0; i < in_dim; i++) {
+        float prod = get_weight(W, i) * input[i];
+        sum = sum + prod;
+
+        if ((i & 31u) == 31u) {
+            sum = q16(sum);
+        }
+    }
+
+    sum += (float)(*bias) * (1.0f / 127.0f);
+
+    return q16(sum);
+}
+
+// Full layer: output = activation(W @ input + bias), quantized to q16 grid
+inline void layer_forward(
+    __global const char* W,      // [out_dim x in_dim]
+    __global const char* bias,   // [out_dim]
+    const float* input,          // [in_dim]
+    float* output,               // [out_dim]
+    uint in_dim,
+    uint out_dim,
+    int use_relu                 // 1 for hidden layers, 0 for output
+) {
+    for (uint i = 0; i < out_dim; i++) {
+        float sum = matmul_row(W + i * in_dim, bias + i, input, in_dim);
+        float activated = use_relu ? fmax(0.0f, sum) : sum;
+        output[i] = q16(activated);
+    }
+}
+
+// ============================================================================
+// Nonce to Input Conversion
+// ============================================================================
+
+inline void nonce_to_input(const uchar* nonce, float* input) {
+    for (int i = 0; i < 32; i++) {
+        // Little-endian int16
+        short val = (short)(nonce[i*2] | (nonce[i*2 + 1] << 8));
+        input[i] = q16((float)val * (1.0f / 32768.0f));
+    }
+}
+
+// ============================================================================
+// RNG (xoroshiro64**)
+// ============================================================================
+
+#define ROTL32(x, k) (((x) << (k)) | ((x) >> (32 - (k))))
+
+inline uint splitmix32(uint x) {
+    x += 0x9e3779b9u;
+    x = (x ^ (x >> 16)) * 0x85ebca6bu;
+    x = (x ^ (x >> 13)) * 0xc2b2ae35u;
+    return x ^ (x >> 16);
+}
+
+inline void init_rng(uint thread_idx, uint seed_lo, uint seed_hi, uint* s0, uint* s1) {
+    *s0 = splitmix32(seed_lo ^ thread_idx);
+    *s1 = splitmix32(seed_hi ^ (thread_idx * 0x9e3779b9u));
+    if (*s0 == 0 && *s1 == 0) *s0 = 1;
+}
+
+inline uint xoroshiro64_next(uint* s0, uint* s1) {
+    uint result = ROTL32(*s0 * 0x9E3779BBu, 5) * 5;
+    uint t = *s1 ^ *s0;
+    *s0 = ROTL32(*s0, 26) ^ t ^ (t << 9);
+    *s1 = ROTL32(t, 13);
+    return result;
+}
+
+inline void generate_nonce(uint* s0, uint* s1, uchar* nonce) {
+    for (int i = 0; i < 16; i++) {
+        uint r = xoroshiro64_next(s0, s1);
+        nonce[i*4 + 0] = (r >> 0) & 0xFF;
+        nonce[i*4 + 1] = (r >> 8) & 0xFF;
+        nonce[i*4 + 2] = (r >> 16) & 0xFF;
+        nonce[i*4 + 3] = (r >> 24) & 0xFF;
+    }
+}
+
+// ============================================================================
+// Network Architecture
+// ============================================================================
+
+#define INPUT_DIM 32
+#define HIDDEN_DIM 128
+#define OUTPUT_DIM 32
+#define DIGEST_BYTES OUTPUT_DIM
+#define DIGEST_PREFIX_BYTES 6
+#define SCORE_SHIFT 48
+
+#define W1_SIZE (HIDDEN_DIM * INPUT_DIM)
+#define B1_SIZE (HIDDEN_DIM)
+#define W2_SIZE (HIDDEN_DIM * HIDDEN_DIM)
+#define B2_SIZE (HIDDEN_DIM)
+#define W3_SIZE (OUTPUT_DIM * HIDDEN_DIM)
+#define B3_SIZE (OUTPUT_DIM)
+
+#define W1_OFFSET 0
+#define B1_OFFSET (W1_OFFSET + W1_SIZE)
+#define W2_OFFSET (B1_OFFSET + B1_SIZE)
+#define B2_OFFSET (W2_OFFSET + W2_SIZE)
+#define W3_OFFSET (B2_OFFSET + B2_SIZE)
+#define B3_OFFSET (W3_OFFSET + W3_SIZE)
+
+// ============================================================================
+// SipHash-2-4 - Proper cryptographic mixing for digest
+// ============================================================================
+
+inline ulong rotl64(ulong x, int b) {
+    return (x << b) | (x >> (64 - b));
+}
+
+inline void sipround(ulong* v0, ulong* v1, ulong* v2, ulong* v3) {
+    *v0 += *v1; *v1 = rotl64(*v1, 13); *v1 ^= *v0; *v0 = rotl64(*v0, 32);
+    *v2 += *v3; *v3 = rotl64(*v3, 16); *v3 ^= *v2;
+    *v0 += *v3; *v3 = rotl64(*v3, 21); *v3 ^= *v0;
+    *v2 += *v1; *v1 = rotl64(*v1, 17); *v1 ^= *v2; *v2 = rotl64(*v2, 32);
+}
+
+// SipHash-2-4 with 128-bit key, returns 64-bit hash
+// Specialized for 132-byte input (128 bytes data + 4 bytes domain separator)
+inline ulong siphash_2_4_132(const uchar* data, ulong k0, ulong k1) {
+    ulong v0 = k0 ^ 0x736f6d6570736575UL;
+    ulong v1 = k1 ^ 0x646f72616e646f6dUL;
+    ulong v2 = k0 ^ 0x6c7967656e657261UL;
+    ulong v3 = k1 ^ 0x7465646279746573UL;
+
+    // Process 16 full 8-byte blocks (128 bytes)
+    for (int blk = 0; blk < 16; blk++) {
+        const uchar* p = data + blk * 8;
+        ulong m = (ulong)p[0]
+                | ((ulong)p[1] << 8)
+                | ((ulong)p[2] << 16)
+                | ((ulong)p[3] << 24)
+                | ((ulong)p[4] << 32)
+                | ((ulong)p[5] << 40)
+                | ((ulong)p[6] << 48)
+                | ((ulong)p[7] << 56);
+        v3 ^= m;
+        sipround(&v0, &v1, &v2, &v3);
+        sipround(&v0, &v1, &v2, &v3);
+        v0 ^= m;
+    }
+
+    // Process final 4 bytes + length (132 = 0x84)
+    const uchar* p = data + 128;
+    ulong b = (132UL << 56)
+            | (ulong)p[0]
+            | ((ulong)p[1] << 8)
+            | ((ulong)p[2] << 16)
+            | ((ulong)p[3] << 24);
+
+    v3 ^= b;
+    sipround(&v0, &v1, &v2, &v3);
+    sipround(&v0, &v1, &v2, &v3);
+    v0 ^= b;
+
+    // Finalization
+    v2 ^= 0xff;
+    sipround(&v0, &v1, &v2, &v3);
+    sipround(&v0, &v1, &v2, &v3);
+    sipround(&v0, &v1, &v2, &v3);
+    sipround(&v0, &v1, &v2, &v3);
+
+    return v0 ^ v1 ^ v2 ^ v3;
+}
+
+// Fixed SipHash key derived from "NeuralPoW" (arbitrary but deterministic)
+#define SIPHASH_K0 0x4e657572616c506fUL
+#define SIPHASH_K1 0x5720446967657374UL
+
+// ============================================================================
+// Score Computation - Neural digest leading zeros
+// ============================================================================
+
+inline void compute_digest(const float* output, uchar* digest, uint dim) {
+    // Serialize q16 integers to bytes (little-endian)
+    uchar serialized[128];
+    for (uint i = 0; i < dim; i++) {
+        int val = q16_to_int(output[i]);
+        serialized[i * 4 + 0] = (uchar)(val & 0xFF);
+        serialized[i * 4 + 1] = (uchar)((val >> 8) & 0xFF);
+        serialized[i * 4 + 2] = (uchar)((val >> 16) & 0xFF);
+        serialized[i * 4 + 3] = (uchar)((val >> 24) & 0xFF);
+    }
+
+    // Generate 32 bytes of digest using SipHash with domain separation
+    for (uint block = 0; block < 4; block++) {
+        // Build input with domain separator
+        uchar input[132];
+        for (int i = 0; i < 128; i++) {
+            input[i] = serialized[i];
+        }
+        input[128] = (uchar)block;
+        input[129] = 0;
+        input[130] = 0;
+        input[131] = 0;
+
+        ulong h = siphash_2_4_132(input, SIPHASH_K0, SIPHASH_K1);
+
+        // Extract 8 bytes from hash (little-endian)
+        for (int i = 0; i < 8; i++) {
+            digest[block * 8 + i] = (uchar)((h >> (i * 8)) & 0xFF);
+        }
+    }
+}
+
+inline int count_leading_zero_bits(const uchar* digest, uint len) {
+    int bits = 0;
+    for (uint i = 0; i < len; i++) {
+        uchar b = digest[i];
+        if (b == 0) {
+            bits += 8;
+            continue;
+        }
+        int lz = 0;
+        uchar mask = 0x80;
+        while ((b & mask) == 0) {
+            lz++;
+            mask >>= 1;
+        }
+        bits += lz;
+        break;
+    }
+    return bits;
+}
+
+inline ulong digest_prefix_value(const uchar* digest) {
+    ulong val = 0;
+    for (int i = 0; i < DIGEST_PREFIX_BYTES; i++) {
+        val = (val << 8) | (ulong)digest[i];
+    }
+    return val;
+}
+
+inline long compute_score_int(const float* output, uint dim) {
+    uchar digest[DIGEST_BYTES];
+    compute_digest(output, digest, dim);
+    int lz_bits = count_leading_zero_bits(digest, DIGEST_BYTES);
+    ulong prefix = digest_prefix_value(digest);
+    return -((long)lz_bits << SCORE_SHIFT) + (long)prefix;
+}
+
+// ============================================================================
+// Result Limits
+// ============================================================================
+
+#define MAX_RESULTS 64
+
+// ============================================================================
+// Main Kernel
+// ============================================================================
+
+__kernel void neural_pow_mine(
+    __global const char* weights,
+    long target_score,               // 64-bit integer score threshold
+    uint seed_lo,
+    uint seed_hi,
+    FOUND_COUNT_T found_count,       // Atomic counter (CL1.2 or CL2.0+ via shim)
+    __global long* found_scores,     // 64-bit integer scores
+    __global uchar* found_nonces
+) {
+    uint thread_idx = (uint)get_global_id(0);
+
+    // Initialize RNG
+    uint s0, s1;
+    init_rng(thread_idx, seed_lo, seed_hi, &s0, &s1);
+
+    // Activation buffers
+    float input[INPUT_DIM];
+    float hidden1[HIDDEN_DIM];
+    float hidden2[HIDDEN_DIM];
+    float output[OUTPUT_DIM];
+    uchar nonce[64];
+
+    for (int iter = 0; iter < HASHES_PER_THREAD; iter++) {
+        // Generate random nonce
+        generate_nonce(&s0, &s1, nonce);
+
+        // Convert nonce to input
+        nonce_to_input(nonce, input);
+
+        // Forward pass
+        // Layer 1: 32 -> 128, ReLU
+        layer_forward(
+            weights + W1_OFFSET, weights + B1_OFFSET,
+            input, hidden1,
+            INPUT_DIM, HIDDEN_DIM, 1
+        );
+
+        // Layer 2: 128 -> 128, ReLU
+        layer_forward(
+            weights + W2_OFFSET, weights + B2_OFFSET,
+            hidden1, hidden2,
+            HIDDEN_DIM, HIDDEN_DIM, 1
+        );
+
+        // Layer 3: 128 -> 32, linear
+        layer_forward(
+            weights + W3_OFFSET, weights + B3_OFFSET,
+            hidden2, output,
+            HIDDEN_DIM, OUTPUT_DIM, 0
+        );
+
+        // Compute integer score (fully deterministic)
+        long score = compute_score_int(output, OUTPUT_DIM);
+
+        // Check target
+        if (score < target_score) {
+            uint slot = reserve_slot(found_count);
+
+            if (slot < MAX_RESULTS) {
+                found_scores[slot] = score;
+
+                __global uchar* nonce_out = found_nonces + slot * 64;
+                for (int i = 0; i < 64; i++) {
+                    nonce_out[i] = nonce[i];
+                }
+            }
+        }
+    }
+}

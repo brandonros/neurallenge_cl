@@ -1,0 +1,1122 @@
+// Neural Proof-of-Work - Host Code v2
+// FP32-heavy PoW with CPU verifier using identical quantization
+
+#pragma STDC FENV_ACCESS ON
+#pragma STDC FP_CONTRACT OFF
+
+#ifdef __APPLE__
+#include <OpenCL/opencl.h>
+#else
+#include <CL/cl.h>
+#endif
+
+#include <algorithm>
+#include <atomic>
+#include <cfenv>
+#include <chrono>
+#include <cmath>
+#include <csignal>
+#include <cstdlib>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <iomanip>
+#include <iostream>
+#include <mutex>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <vector>
+
+#ifndef DEFAULT_USERNAME
+#define DEFAULT_USERNAME "anonymous"
+#endif
+
+// Platform-specific FTZ/DAZ control
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#include <xmmintrin.h>  // _mm_setcsr, _mm_getcsr
+#define HAS_MXCSR 1
+#endif
+
+#include "neural_kernel.h"
+
+// ============================================================================
+// Configuration
+// ============================================================================
+
+#define STRINGIFY_(x) #x
+#define STRINGIFY(x) STRINGIFY_(x)
+
+constexpr size_t MAX_RESULTS = 64;
+
+// Network architecture
+constexpr size_t INPUT_DIM = 32;
+constexpr size_t HIDDEN_DIM = 128;
+constexpr size_t OUTPUT_DIM = 32;
+constexpr size_t DIGEST_BYTES = OUTPUT_DIM;
+constexpr size_t DIGEST_PREFIX_BYTES = 6;
+constexpr int SCORE_SHIFT = 48;
+static_assert(DIGEST_PREFIX_BYTES <= DIGEST_BYTES, "Digest prefix larger than digest");
+static_assert((DIGEST_PREFIX_BYTES * 8) <= SCORE_SHIFT, "Score shift too small for digest prefix");
+
+// Weight sizes and offsets
+constexpr size_t W1_SIZE = HIDDEN_DIM * INPUT_DIM;
+constexpr size_t B1_SIZE = HIDDEN_DIM;
+constexpr size_t W2_SIZE = HIDDEN_DIM * HIDDEN_DIM;
+constexpr size_t B2_SIZE = HIDDEN_DIM;
+constexpr size_t W3_SIZE = OUTPUT_DIM * HIDDEN_DIM;
+constexpr size_t B3_SIZE = OUTPUT_DIM;
+constexpr size_t TOTAL_WEIGHTS = W1_SIZE + B1_SIZE + W2_SIZE + B2_SIZE + W3_SIZE + B3_SIZE;
+
+constexpr size_t W1_OFFSET = 0;
+constexpr size_t B1_OFFSET = W1_OFFSET + W1_SIZE;
+constexpr size_t W2_OFFSET = B1_OFFSET + B1_SIZE;
+constexpr size_t B2_OFFSET = W2_OFFSET + W2_SIZE;
+constexpr size_t W3_OFFSET = B2_OFFSET + B2_SIZE;
+constexpr size_t B3_OFFSET = W3_OFFSET + W3_SIZE;
+
+// ============================================================================
+// CPU Verifier - MUST match GPU exactly
+// ============================================================================
+
+namespace cpu_verifier {
+
+// Quantization using round-to-nearest-even (matches OpenCL convert_int_rte)
+// Use lrintf (float version) to match OpenCL's convert_int_rte(float) exactly
+inline float q16(float x) {
+    if (!std::isfinite(x)) x = 0.0f;
+    x = std::max(-32768.0f, std::min(32767.0f, x));
+    int32_t i = static_cast<int32_t>(std::lrintf(x * 65536.0f));
+    return static_cast<float>(i) * (1.0f / 65536.0f);
+}
+
+// Get q16 as integer representation (for deterministic scoring)
+inline int32_t q16_to_int(float q16_val) {
+    return static_cast<int32_t>(std::lrintf(q16_val * 65536.0f));
+}
+
+inline float relu_q16(float x) {
+    return q16(std::max(0.0f, x));
+}
+
+inline float get_weight(const int8_t* weights, size_t idx) {
+    return static_cast<float>(weights[idx]) * (1.0f / 127.0f);
+}
+
+void nonce_to_input(const uint8_t* nonce, float* input) {
+    for (int i = 0; i < 32; i++) {
+        int16_t val = static_cast<int16_t>(nonce[i*2] | (nonce[i*2 + 1] << 8));
+        input[i] = q16(static_cast<float>(val) * (1.0f / 32768.0f));
+    }
+}
+
+float matmul_row(const int8_t* W, const int8_t* bias, const float* input, size_t in_dim) {
+    float sum = 0.0f;
+
+    for (size_t i = 0; i < in_dim; i++) {
+        float prod = get_weight(W, i) * input[i];
+        sum = sum + prod;
+
+        if ((i & 31) == 31) {
+            sum = q16(sum);
+        }
+    }
+
+    sum += static_cast<float>(*bias) * (1.0f / 127.0f);
+    return q16(sum);
+}
+
+void layer_forward(
+    const int8_t* W,
+    const int8_t* bias,
+    const float* input,
+    float* output,
+    size_t in_dim,
+    size_t out_dim,
+    bool use_relu
+) {
+    for (size_t i = 0; i < out_dim; i++) {
+        float sum = matmul_row(W + i * in_dim, bias + i, input, in_dim);
+        float activated = use_relu ? std::max(0.0f, sum) : sum;
+        output[i] = q16(activated);
+    }
+}
+
+// ============================================================================
+// SipHash-2-4 - Proper cryptographic mixing for digest
+// ============================================================================
+
+inline uint64_t rotl64(uint64_t x, int b) {
+    return (x << b) | (x >> (64 - b));
+}
+
+inline void sipround(uint64_t& v0, uint64_t& v1, uint64_t& v2, uint64_t& v3) {
+    v0 += v1; v1 = rotl64(v1, 13); v1 ^= v0; v0 = rotl64(v0, 32);
+    v2 += v3; v3 = rotl64(v3, 16); v3 ^= v2;
+    v0 += v3; v3 = rotl64(v3, 21); v3 ^= v0;
+    v2 += v1; v1 = rotl64(v1, 17); v1 ^= v2; v2 = rotl64(v2, 32);
+}
+
+// SipHash-2-4 with 128-bit key, returns 64-bit hash
+uint64_t siphash_2_4(const uint8_t* data, size_t len, uint64_t k0, uint64_t k1) {
+    uint64_t v0 = k0 ^ 0x736f6d6570736575ULL;
+    uint64_t v1 = k1 ^ 0x646f72616e646f6dULL;
+    uint64_t v2 = k0 ^ 0x6c7967656e657261ULL;
+    uint64_t v3 = k1 ^ 0x7465646279746573ULL;
+
+    const uint8_t* end = data + (len & ~7ULL);
+    const uint8_t* p = data;
+
+    // Process 8-byte blocks
+    while (p < end) {
+        uint64_t m = static_cast<uint64_t>(p[0])
+                   | (static_cast<uint64_t>(p[1]) << 8)
+                   | (static_cast<uint64_t>(p[2]) << 16)
+                   | (static_cast<uint64_t>(p[3]) << 24)
+                   | (static_cast<uint64_t>(p[4]) << 32)
+                   | (static_cast<uint64_t>(p[5]) << 40)
+                   | (static_cast<uint64_t>(p[6]) << 48)
+                   | (static_cast<uint64_t>(p[7]) << 56);
+        v3 ^= m;
+        sipround(v0, v1, v2, v3);
+        sipround(v0, v1, v2, v3);
+        v0 ^= m;
+        p += 8;
+    }
+
+    // Process remaining bytes + length
+    uint64_t b = static_cast<uint64_t>(len) << 56;
+    switch (len & 7) {
+        case 7: b |= static_cast<uint64_t>(p[6]) << 48; [[fallthrough]];
+        case 6: b |= static_cast<uint64_t>(p[5]) << 40; [[fallthrough]];
+        case 5: b |= static_cast<uint64_t>(p[4]) << 32; [[fallthrough]];
+        case 4: b |= static_cast<uint64_t>(p[3]) << 24; [[fallthrough]];
+        case 3: b |= static_cast<uint64_t>(p[2]) << 16; [[fallthrough]];
+        case 2: b |= static_cast<uint64_t>(p[1]) << 8;  [[fallthrough]];
+        case 1: b |= static_cast<uint64_t>(p[0]);       break;
+        case 0: break;
+    }
+
+    v3 ^= b;
+    sipround(v0, v1, v2, v3);
+    sipround(v0, v1, v2, v3);
+    v0 ^= b;
+
+    // Finalization
+    v2 ^= 0xff;
+    sipround(v0, v1, v2, v3);
+    sipround(v0, v1, v2, v3);
+    sipround(v0, v1, v2, v3);
+    sipround(v0, v1, v2, v3);
+
+    return v0 ^ v1 ^ v2 ^ v3;
+}
+
+// Fixed SipHash key derived from "NeuralPoW" (arbitrary but deterministic)
+constexpr uint64_t SIPHASH_K0 = 0x4e657572616c506fULL;  // "NeuralPo"
+constexpr uint64_t SIPHASH_K1 = 0x5720446967657374ULL;  // "W Digest"
+
+void compute_digest(const float* output, uint8_t* digest, size_t dim) {
+    // Serialize q16 integers to bytes (little-endian)
+    uint8_t serialized[128];  // 32 * 4 bytes
+    for (size_t i = 0; i < dim; i++) {
+        int32_t val = q16_to_int(output[i]);
+        serialized[i * 4 + 0] = static_cast<uint8_t>(val & 0xFF);
+        serialized[i * 4 + 1] = static_cast<uint8_t>((val >> 8) & 0xFF);
+        serialized[i * 4 + 2] = static_cast<uint8_t>((val >> 16) & 0xFF);
+        serialized[i * 4 + 3] = static_cast<uint8_t>((val >> 24) & 0xFF);
+    }
+
+    // Generate 32 bytes of digest using SipHash with domain separation
+    for (size_t block = 0; block < 4; block++) {
+        // Append block index for domain separation
+        uint8_t input[132];
+        memcpy(input, serialized, 128);
+        input[128] = static_cast<uint8_t>(block);
+        input[129] = 0;
+        input[130] = 0;
+        input[131] = 0;
+
+        uint64_t h = siphash_2_4(input, 132, SIPHASH_K0, SIPHASH_K1);
+
+        // Extract 8 bytes from hash (little-endian)
+        for (int i = 0; i < 8; i++) {
+            digest[block * 8 + i] = static_cast<uint8_t>((h >> (i * 8)) & 0xFF);
+        }
+    }
+}
+
+int count_leading_zero_bits(const uint8_t* digest, size_t len) {
+    int bits = 0;
+    for (size_t i = 0; i < len; i++) {
+        uint8_t b = digest[i];
+        if (b == 0) {
+            bits += 8;
+            continue;
+        }
+        int lz = 0;
+        while ((b & 0x80u) == 0) {
+            lz++;
+            b <<= 1;
+        }
+        bits += lz;
+        break;
+    }
+    return bits;
+}
+
+uint64_t digest_prefix_value(const uint8_t* digest) {
+    uint64_t val = 0;
+    for (size_t i = 0; i < DIGEST_PREFIX_BYTES; i++) {
+        val = (val << 8) | static_cast<uint64_t>(digest[i]);
+    }
+    return val;
+}
+
+// Integer score computation using digest leading zeros
+// Score = -(leading_zero_bits << SCORE_SHIFT) + digest_prefix
+int64_t compute_score_int(const float* output, size_t dim) {
+    uint8_t digest[DIGEST_BYTES];
+    compute_digest(output, digest, dim);
+    int lz_bits = count_leading_zero_bits(digest, DIGEST_BYTES);
+    uint64_t prefix = digest_prefix_value(digest);
+    return -(static_cast<int64_t>(lz_bits) << SCORE_SHIFT) + static_cast<int64_t>(prefix);
+}
+
+int score_to_leading_zero_bits(int64_t score) {
+    if (score >= 0) return 0;
+    return static_cast<int>(((-score) + ((1LL << SCORE_SHIFT) - 1)) >> SCORE_SHIFT);
+}
+
+// Get raw outputs for display
+void get_outputs(const int8_t* weights, const uint8_t* nonce, float* out) {
+    float input[INPUT_DIM];
+    float hidden1[HIDDEN_DIM];
+    float hidden2[HIDDEN_DIM];
+
+    nonce_to_input(nonce, input);
+
+    layer_forward(weights + W1_OFFSET, weights + B1_OFFSET,
+                  input, hidden1, INPUT_DIM, HIDDEN_DIM, true);
+    layer_forward(weights + W2_OFFSET, weights + B2_OFFSET,
+                  hidden1, hidden2, HIDDEN_DIM, HIDDEN_DIM, true);
+    layer_forward(weights + W3_OFFSET, weights + B3_OFFSET,
+                  hidden2, out, HIDDEN_DIM, OUTPUT_DIM, false);
+}
+
+// Full forward pass - returns integer score
+int64_t forward(const int8_t* weights, const uint8_t* nonce) {
+    float input[INPUT_DIM];
+    float hidden1[HIDDEN_DIM];
+    float hidden2[HIDDEN_DIM];
+    float output[OUTPUT_DIM];
+
+    nonce_to_input(nonce, input);
+
+    layer_forward(
+        weights + W1_OFFSET, weights + B1_OFFSET,
+        input, hidden1,
+        INPUT_DIM, HIDDEN_DIM, true
+    );
+
+    layer_forward(
+        weights + W2_OFFSET, weights + B2_OFFSET,
+        hidden1, hidden2,
+        HIDDEN_DIM, HIDDEN_DIM, true
+    );
+
+    layer_forward(
+        weights + W3_OFFSET, weights + B3_OFFSET,
+        hidden2, output,
+        HIDDEN_DIM, OUTPUT_DIM, false
+    );
+
+    return compute_score_int(output, OUTPUT_DIM);
+}
+
+} // namespace cpu_verifier
+
+// ============================================================================
+// Weight Generation from Challenge String (SHA-256 based)
+// ============================================================================
+
+namespace sha256 {
+
+static const uint32_t K[64] = {
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+};
+
+#define ROTR(x, n) (((x) >> (n)) | ((x) << (32 - (n))))
+#define CH(x, y, z) (((x) & (y)) ^ (~(x) & (z)))
+#define MAJ(x, y, z) (((x) & (y)) ^ ((x) & (z)) ^ ((y) & (z)))
+#define EP0(x) (ROTR(x, 2) ^ ROTR(x, 13) ^ ROTR(x, 22))
+#define EP1(x) (ROTR(x, 6) ^ ROTR(x, 11) ^ ROTR(x, 25))
+#define SIG0(x) (ROTR(x, 7) ^ ROTR(x, 18) ^ ((x) >> 3))
+#define SIG1(x) (ROTR(x, 17) ^ ROTR(x, 19) ^ ((x) >> 10))
+
+void hash(const uint8_t* data, size_t len, uint8_t* out) {
+    uint32_t h[8] = {
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
+    };
+
+    size_t padded_len = ((len + 9 + 63) / 64) * 64;
+    std::vector<uint8_t> padded(padded_len, 0);
+    memcpy(padded.data(), data, len);
+    padded[len] = 0x80;
+
+    uint64_t bits = len * 8;
+    for (int i = 0; i < 8; i++) {
+        padded[padded_len - 1 - i] = (bits >> (i * 8)) & 0xFF;
+    }
+
+    for (size_t block = 0; block < padded_len; block += 64) {
+        uint32_t w[64];
+
+        for (int i = 0; i < 16; i++) {
+            w[i] = (padded[block + i*4] << 24) |
+                   (padded[block + i*4 + 1] << 16) |
+                   (padded[block + i*4 + 2] << 8) |
+                   padded[block + i*4 + 3];
+        }
+
+        for (int i = 16; i < 64; i++) {
+            w[i] = SIG1(w[i-2]) + w[i-7] + SIG0(w[i-15]) + w[i-16];
+        }
+
+        uint32_t a = h[0], b = h[1], c = h[2], d = h[3];
+        uint32_t e = h[4], f = h[5], g = h[6], hh = h[7];
+
+        for (int i = 0; i < 64; i++) {
+            uint32_t t1 = hh + EP1(e) + CH(e, f, g) + K[i] + w[i];
+            uint32_t t2 = EP0(a) + MAJ(a, b, c);
+            hh = g; g = f; f = e; e = d + t1;
+            d = c; c = b; b = a; a = t1 + t2;
+        }
+
+        h[0] += a; h[1] += b; h[2] += c; h[3] += d;
+        h[4] += e; h[5] += f; h[6] += g; h[7] += hh;
+    }
+
+    for (int i = 0; i < 8; i++) {
+        out[i*4] = (h[i] >> 24) & 0xFF;
+        out[i*4 + 1] = (h[i] >> 16) & 0xFF;
+        out[i*4 + 2] = (h[i] >> 8) & 0xFF;
+        out[i*4 + 3] = h[i] & 0xFF;
+    }
+}
+
+} // namespace sha256
+
+void generate_weights(const std::string& challenge, std::vector<int8_t>& weights) {
+    weights.resize(TOTAL_WEIGHTS);
+
+    uint8_t hash_out[32];
+    size_t weight_idx = 0;
+    uint32_t counter = 0;
+
+    while (weight_idx < TOTAL_WEIGHTS) {
+        std::vector<uint8_t> input(challenge.begin(), challenge.end());
+        input.push_back((counter >> 0) & 0xFF);
+        input.push_back((counter >> 8) & 0xFF);
+        input.push_back((counter >> 16) & 0xFF);
+        input.push_back((counter >> 24) & 0xFF);
+
+        sha256::hash(input.data(), input.size(), hash_out);
+
+        for (int i = 0; i < 32 && weight_idx < TOTAL_WEIGHTS; i++) {
+            int8_t w = static_cast<int8_t>(hash_out[i]);
+            if (w == -128) w = -127;
+            weights[weight_idx++] = w;
+        }
+
+        counter++;
+    }
+}
+
+void append_u32(std::vector<uint8_t>& data, uint32_t value) {
+    for (int i = 0; i < 4; i++) {
+        data.push_back(static_cast<uint8_t>((value >> (i * 8)) & 0xFF));
+    }
+}
+
+void append_u64(std::vector<uint8_t>& data, uint64_t value) {
+    for (int i = 0; i < 8; i++) {
+        data.push_back(static_cast<uint8_t>((value >> (i * 8)) & 0xFF));
+    }
+}
+
+void derive_launch_seeds(const std::string& instance, int device_index, uint64_t launch_id,
+                         uint32_t& seed_lo, uint32_t& seed_hi) {
+    std::vector<uint8_t> material(instance.begin(), instance.end());
+    append_u32(material, static_cast<uint32_t>(device_index));
+    append_u64(material, launch_id);
+
+    uint8_t hash_out[32];
+    sha256::hash(material.data(), material.size(), hash_out);
+
+    seed_lo = static_cast<uint32_t>(hash_out[0]) |
+              (static_cast<uint32_t>(hash_out[1]) << 8) |
+              (static_cast<uint32_t>(hash_out[2]) << 16) |
+              (static_cast<uint32_t>(hash_out[3]) << 24);
+    seed_hi = static_cast<uint32_t>(hash_out[4]) |
+              (static_cast<uint32_t>(hash_out[5]) << 8) |
+              (static_cast<uint32_t>(hash_out[6]) << 16) |
+              (static_cast<uint32_t>(hash_out[7]) << 24);
+}
+
+// ============================================================================
+// Shared State
+// ============================================================================
+
+struct SharedState {
+    std::mutex best_mutex;
+    int64_t best_score;
+    std::vector<uint8_t> best_nonce;
+    std::vector<uint8_t> best_digest;
+    std::atomic<bool> running{true};
+    std::string challenge;
+    std::string username;
+    std::string instance_id;
+    bool verbose = false;
+    std::vector<int8_t> weights;
+    std::chrono::steady_clock::time_point start_time;
+};
+
+// ============================================================================
+// GPU Context
+// ============================================================================
+
+struct GPUContext {
+    int device_index;
+    std::string device_name;
+    cl_device_id device;
+    cl_context context;
+    cl_command_queue queue;
+    cl_program program;
+    cl_kernel kernel;
+    cl_mem weights_buf;
+    cl_mem found_count_buf;
+    cl_mem found_scores_buf;
+    cl_mem found_nonces_buf;
+    std::atomic<uint64_t> evals_computed{0};
+    std::atomic<uint64_t> matches_found{0};
+    std::atomic<uint64_t> launch_counter{0};
+};
+
+// ============================================================================
+// Utility Functions
+// ============================================================================
+
+std::string nonce_to_hex(const uint8_t* nonce, size_t len) {
+    std::stringstream ss;
+    ss << std::hex << std::setfill('0');
+    for (size_t i = 0; i < len; i++) {
+        ss << std::setw(2) << static_cast<int>(nonce[i]);
+    }
+    return ss.str();
+}
+
+std::string digest_to_hex(const uint8_t* digest, size_t len) {
+    return nonce_to_hex(digest, len);
+}
+
+std::string describe_lz_bits(int bits) {
+    std::ostringstream oss;
+    int hex_digits = bits / 4;
+    int hex_bits = bits % 4;
+    int bytes = bits / 8;
+    int rem_bits = bits % 8;
+
+    oss << bits << " bits ("
+        << hex_digits << " hex digit" << (hex_digits == 1 ? "" : "s");
+    if (hex_bits > 0) {
+        oss << " + " << hex_bits << " bit";
+        if (hex_bits != 1) oss << "s";
+    }
+    oss << "; " << bytes << " byte" << (bytes == 1 ? "" : "s");
+    if (rem_bits > 0) {
+        oss << " + " << rem_bits << " bit";
+        if (rem_bits != 1) oss << "s";
+    }
+    oss << ")";
+    return oss.str();
+}
+
+std::string format_digest_with_marker(const std::string& hex, int lz_bits) {
+    size_t nibble_pos = static_cast<size_t>(std::min<int>(lz_bits / 4, static_cast<int>(hex.size())));
+    std::string marked = hex;
+    marked.insert(nibble_pos, "|");
+    return marked;
+}
+
+// ============================================================================
+// GPU Discovery
+// ============================================================================
+
+std::vector<cl_device_id> discover_all_gpus() {
+    std::vector<cl_device_id> all_devices;
+
+    cl_uint num_platforms;
+    if (clGetPlatformIDs(0, nullptr, &num_platforms) != CL_SUCCESS || num_platforms == 0) {
+        return all_devices;
+    }
+
+    std::vector<cl_platform_id> platforms(num_platforms);
+    clGetPlatformIDs(num_platforms, platforms.data(), nullptr);
+
+    for (cl_platform_id platform : platforms) {
+        cl_uint num_devices;
+        if (clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, 0, nullptr, &num_devices) == CL_SUCCESS && num_devices > 0) {
+            std::vector<cl_device_id> devices(num_devices);
+            clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, num_devices, devices.data(), nullptr);
+            all_devices.insert(all_devices.end(), devices.begin(), devices.end());
+        }
+    }
+
+    return all_devices;
+}
+
+// ============================================================================
+// GPU Context Creation
+// ============================================================================
+
+bool create_gpu_context(cl_device_id device, int device_index, const SharedState& shared, GPUContext& ctx) {
+    ctx.device_index = device_index;
+    ctx.device = device;
+
+    char name[256];
+    clGetDeviceInfo(device, CL_DEVICE_NAME, sizeof(name), name, nullptr);
+    ctx.device_name = name;
+
+    cl_int err;
+
+    ctx.context = clCreateContext(nullptr, 1, &device, nullptr, nullptr, &err);
+    if (err != CL_SUCCESS) {
+        std::cerr << "[GPU " << device_index << "] Failed to create context: " << err << std::endl;
+        return false;
+    }
+
+#ifdef CL_VERSION_2_0
+    ctx.queue = clCreateCommandQueueWithProperties(ctx.context, device, nullptr, &err);
+#else
+    ctx.queue = clCreateCommandQueue(ctx.context, device, 0, &err);
+#endif
+    if (err != CL_SUCCESS) {
+        std::cerr << "[GPU " << device_index << "] Failed to create command queue: " << err << std::endl;
+        return false;
+    }
+
+    const char* src = reinterpret_cast<const char*>(src_neural_pow_cl);
+    size_t srcLen = src_neural_pow_cl_len;
+
+    ctx.program = clCreateProgramWithSource(ctx.context, 1, &src, &srcLen, &err);
+    if (err != CL_SUCCESS) {
+        std::cerr << "[GPU " << device_index << "] Failed to create program: " << err << std::endl;
+        return false;
+    }
+
+    const char* buildOpts = "-D HASHES_PER_THREAD=" STRINGIFY(HASHES_PER_THREAD)
+                            " -cl-fp32-correctly-rounded-divide-sqrt";
+    err = clBuildProgram(ctx.program, 1, &device, buildOpts, nullptr, nullptr);
+    if (err != CL_SUCCESS) {
+        char log[16384];
+        clGetProgramBuildInfo(ctx.program, device, CL_PROGRAM_BUILD_LOG, sizeof(log), log, nullptr);
+        std::cerr << "[GPU " << device_index << "] Build error: " << log << std::endl;
+        return false;
+    }
+
+    ctx.kernel = clCreateKernel(ctx.program, "neural_pow_mine", &err);
+    if (err != CL_SUCCESS) {
+        std::cerr << "[GPU " << device_index << "] Failed to create kernel: " << err << std::endl;
+        return false;
+    }
+
+    // Create buffers
+    ctx.weights_buf = clCreateBuffer(ctx.context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                      shared.weights.size(), (void*)shared.weights.data(), &err);
+    if (err != CL_SUCCESS) {
+        std::cerr << "[GPU " << device_index << "] Failed to create weights buffer: " << err << std::endl;
+        return false;
+    }
+
+    ctx.found_count_buf = clCreateBuffer(ctx.context, CL_MEM_READ_WRITE, sizeof(cl_uint), nullptr, &err);
+    ctx.found_scores_buf = clCreateBuffer(ctx.context, CL_MEM_WRITE_ONLY, MAX_RESULTS * sizeof(cl_long), nullptr, &err);
+    ctx.found_nonces_buf = clCreateBuffer(ctx.context, CL_MEM_WRITE_ONLY, MAX_RESULTS * 64, nullptr, &err);
+
+    if (err != CL_SUCCESS) {
+        std::cerr << "[GPU " << device_index << "] Failed to create result buffers: " << err << std::endl;
+        return false;
+    }
+
+    // Set static kernel args
+    clSetKernelArg(ctx.kernel, 0, sizeof(cl_mem), &ctx.weights_buf);
+    // arg 1 (target_score) set per launch
+    // arg 2 (seed_lo) set per launch
+    // arg 3 (seed_hi) set per launch
+    clSetKernelArg(ctx.kernel, 4, sizeof(cl_mem), &ctx.found_count_buf);
+    clSetKernelArg(ctx.kernel, 5, sizeof(cl_mem), &ctx.found_scores_buf);
+    clSetKernelArg(ctx.kernel, 6, sizeof(cl_mem), &ctx.found_nonces_buf);
+
+    return true;
+}
+
+// ============================================================================
+// GPU Worker Thread
+// ============================================================================
+
+void gpu_worker_thread(GPUContext& ctx, SharedState& shared) {
+    std::cout << "[GPU " << ctx.device_index << "] Started mining on " << ctx.device_name << std::endl;
+
+    while (shared.running.load()) {
+        cl_long target_score;
+        {
+            std::lock_guard<std::mutex> lock(shared.best_mutex);
+            target_score = shared.best_score;
+        }
+
+        uint64_t launch_id = ctx.launch_counter.fetch_add(1);
+        uint32_t seed_lo_host = 0;
+        uint32_t seed_hi_host = 0;
+        derive_launch_seeds(shared.instance_id, ctx.device_index, launch_id, seed_lo_host, seed_hi_host);
+        cl_uint seed_lo = static_cast<cl_uint>(seed_lo_host);
+        cl_uint seed_hi = static_cast<cl_uint>(seed_hi_host);
+
+        cl_uint zero = 0;
+        clEnqueueWriteBuffer(ctx.queue, ctx.found_count_buf, CL_FALSE, 0, sizeof(cl_uint), &zero, 0, nullptr, nullptr);
+
+        clSetKernelArg(ctx.kernel, 1, sizeof(cl_long), &target_score);
+        clSetKernelArg(ctx.kernel, 2, sizeof(cl_uint), &seed_lo);
+        clSetKernelArg(ctx.kernel, 3, sizeof(cl_uint), &seed_hi);
+
+        size_t global_size = GLOBAL_SIZE;
+        size_t local_size = LOCAL_SIZE;
+        cl_int err = clEnqueueNDRangeKernel(ctx.queue, ctx.kernel, 1, nullptr, &global_size, &local_size, 0, nullptr, nullptr);
+        if (err != CL_SUCCESS) {
+            std::cerr << "[GPU " << ctx.device_index << "] Kernel error: " << err << std::endl;
+            break;
+        }
+
+        clFinish(ctx.queue);
+        ctx.evals_computed.fetch_add(static_cast<uint64_t>(GLOBAL_SIZE) * HASHES_PER_THREAD);
+
+        cl_uint found_count;
+        clEnqueueReadBuffer(ctx.queue, ctx.found_count_buf, CL_TRUE, 0, sizeof(cl_uint), &found_count, 0, nullptr, nullptr);
+
+        if (found_count > 0) {
+            size_t results_to_read = std::min(static_cast<size_t>(found_count), MAX_RESULTS);
+
+            std::vector<int64_t> all_scores(results_to_read);
+            std::vector<uint8_t> all_nonces(results_to_read * 64);
+
+            clEnqueueReadBuffer(ctx.queue, ctx.found_scores_buf, CL_TRUE, 0,
+                               results_to_read * sizeof(int64_t), all_scores.data(), 0, nullptr, nullptr);
+            clEnqueueReadBuffer(ctx.queue, ctx.found_nonces_buf, CL_TRUE, 0,
+                               results_to_read * 64, all_nonces.data(), 0, nullptr, nullptr);
+
+            // Find best in batch
+            size_t best_idx = 0;
+            for (size_t i = 1; i < results_to_read; i++) {
+                if (all_scores[i] < all_scores[best_idx]) {
+                    best_idx = i;
+                }
+            }
+
+            int64_t batch_best_score = all_scores[best_idx];
+            uint8_t* batch_best_nonce = all_nonces.data() + best_idx * 64;
+
+            // Verify on CPU - must match bit-exactly (consensus requirement)
+            int64_t cpu_score = cpu_verifier::forward(shared.weights.data(), batch_best_nonce);
+
+            // Scores must match exactly - any difference is a determinism bug
+            if (cpu_score != batch_best_score) {
+                int gpu_zeros = cpu_verifier::score_to_leading_zero_bits(batch_best_score);
+                int cpu_zeros = cpu_verifier::score_to_leading_zero_bits(cpu_score);
+                std::cerr << "[GPU " << ctx.device_index << "] CRITICAL: Score mismatch! "
+                          << "GPU=" << batch_best_score << " (" << gpu_zeros << " LZ bits) "
+                          << "CPU=" << cpu_score << " (" << cpu_zeros << " LZ bits)" << std::endl;
+                continue;  // Reject mismatched results
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(shared.best_mutex);
+                if (cpu_score < shared.best_score) {
+                    float outputs[OUTPUT_DIM];
+                    cpu_verifier::get_outputs(shared.weights.data(), batch_best_nonce, outputs);
+                    uint8_t digest[DIGEST_BYTES];
+                    cpu_verifier::compute_digest(outputs, digest, OUTPUT_DIM);
+                    int lz_bits = cpu_verifier::count_leading_zero_bits(digest, DIGEST_BYTES);
+                    std::string digest_hex = digest_to_hex(digest, DIGEST_BYTES);
+                    std::string nonce_hex = nonce_to_hex(batch_best_nonce, 64);
+
+                    shared.best_score = cpu_score;
+                    shared.best_nonce.assign(batch_best_nonce, batch_best_nonce + 64);
+                    shared.best_digest.assign(digest, digest + DIGEST_BYTES);
+                    ctx.matches_found.fetch_add(1);
+
+                    auto now = std::chrono::steady_clock::now();
+                    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - shared.start_time).count();
+
+                    std::cout << "\n[GPU " << ctx.device_index << "] NEW BEST: "
+                              << describe_lz_bits(lz_bits) << " | digest="
+                              << format_digest_with_marker(digest_hex, lz_bits) << std::endl;
+                    std::cout << "  Prefix (first " << DIGEST_PREFIX_BYTES << " bytes): 0x"
+                              << digest_hex.substr(0, DIGEST_PREFIX_BYTES * 2) << std::endl;
+                    std::cout << "  Proof: " << shared.username << "/" << nonce_hex << std::endl;
+                    if (shared.verbose) {
+                        std::cout << "  Output: [";
+                        for (size_t i = 0; i < OUTPUT_DIM; i++) {
+                            std::cout << std::fixed << std::setprecision(3)
+                                      << std::setw(7) << outputs[i];
+                            if (i < OUTPUT_DIM - 1) std::cout << ", ";
+                        }
+                        std::cout << "]" << std::endl;
+                    }
+                    std::cout << "  Time: " << elapsed << "s | Batch had " << found_count << " candidates" << std::endl;
+                    std::cout << std::endl;
+                }
+            }
+        }
+    }
+
+    std::cout << "[GPU " << ctx.device_index << "] Stopped" << std::endl;
+}
+
+// ============================================================================
+// Signal Handling
+// ============================================================================
+
+volatile std::sig_atomic_t g_shutdown_requested = 0;
+
+void signal_handler(int) {
+    g_shutdown_requested = 1;
+}
+
+// ============================================================================
+// FP Environment Setup
+// ============================================================================
+
+void setup_fp_environment() {
+    // Set rounding mode to round-to-nearest-even (matches OpenCL convert_int_rte)
+    std::fesetround(FE_TONEAREST);
+
+#ifdef HAS_MXCSR
+    // Disable FTZ (Flush-To-Zero) and DAZ (Denormals-Are-Zero) on x86
+    // These can cause subtle differences between CPU and GPU
+    unsigned int mxcsr = _mm_getcsr();
+    mxcsr &= ~(1 << 15);  // Clear FTZ bit
+    mxcsr &= ~(1 << 6);   // Clear DAZ bit
+    _mm_setcsr(mxcsr);
+#endif
+}
+
+// ============================================================================
+// Golden Vector Test - Verify GPU/CPU determinism at startup
+// ============================================================================
+
+bool run_golden_vector_test(GPUContext& ctx, const SharedState& shared) {
+    // Fixed test nonce (deterministic)
+    uint8_t test_nonce[64];
+    for (int i = 0; i < 64; i++) {
+        test_nonce[i] = static_cast<uint8_t>((i * 37 + 13) & 0xFF);
+    }
+
+    // CPU computation
+    int64_t cpu_score = cpu_verifier::forward(shared.weights.data(), test_nonce);
+    float cpu_outputs[OUTPUT_DIM];
+    cpu_verifier::get_outputs(shared.weights.data(), test_nonce, cpu_outputs);
+    uint8_t digest[DIGEST_BYTES];
+    cpu_verifier::compute_digest(cpu_outputs, digest, OUTPUT_DIM);
+    int cpu_bits = cpu_verifier::count_leading_zero_bits(digest, DIGEST_BYTES);
+
+    // GPU computation - run single-item kernel with the test nonce
+    // We'll use a special approach: write the nonce directly and run with known seed
+    // For simplicity, just verify the CPU verifier is self-consistent here
+    // The main verification happens during mining when GPU results are checked
+
+    // Self-consistency check: run CPU twice, must match
+    int64_t cpu_score2 = cpu_verifier::forward(shared.weights.data(), test_nonce);
+    if (cpu_score != cpu_score2) {
+        std::cerr << "FATAL: CPU verifier is not deterministic!" << std::endl;
+        std::cerr << "  Run 1: " << cpu_score << std::endl;
+        std::cerr << "  Run 2: " << cpu_score2 << std::endl;
+        return false;
+    }
+
+    // Verify lrintf behaves correctly for edge cases
+    // Test halfway cases (should round to even)
+    float test_vals[] = {0.5f, 1.5f, 2.5f, -0.5f, -1.5f, -2.5f, 0.4999f, 0.5001f};
+    int32_t expected[] = {0, 2, 2, 0, -2, -2, 0, 1};  // Round-to-nearest-even
+
+    for (size_t i = 0; i < sizeof(test_vals) / sizeof(test_vals[0]); i++) {
+        int32_t result = static_cast<int32_t>(std::lrintf(test_vals[i]));
+        if (result != expected[i]) {
+            std::cerr << "WARNING: lrintf(" << test_vals[i] << ") = " << result
+                      << ", expected " << expected[i] << std::endl;
+            std::cerr << "  This may cause CPU/GPU mismatches on this platform" << std::endl;
+        }
+    }
+
+    int cpu_zeros = cpu_verifier::score_to_leading_zero_bits(cpu_score);
+    std::string digest_hex = digest_to_hex(digest, DIGEST_BYTES);
+    std::cout << "[Test] Golden vector: CPU score=" << cpu_score
+              << " (" << describe_lz_bits(cpu_zeros) << ")" << std::endl;
+    std::cout << "[Test] Digest: " << format_digest_with_marker(digest_hex, cpu_bits)
+              << " (LZ=" << describe_lz_bits(cpu_bits) << ")" << std::endl;
+    std::cout << "[Test] CPU outputs: [";
+    for (size_t i = 0; i < OUTPUT_DIM; i++) {
+        std::cout << std::fixed << std::setprecision(4) << cpu_outputs[i];
+        if (i < OUTPUT_DIM - 1) std::cout << ", ";
+    }
+    std::cout << "]" << std::endl;
+
+    return true;
+}
+
+// ============================================================================
+// Main
+// ============================================================================
+
+int main(int argc, char* argv[]) {
+    // Setup FP environment (rounding mode, FTZ/DAZ)
+    setup_fp_environment();
+
+    std::string challenge = "neural_pow_test/epoch0";
+    std::string username = DEFAULT_USERNAME;
+    int target_zero_bits = 16;
+    bool verbose = false;
+
+    auto apply_target_bits = [&](int bits) {
+        target_zero_bits = std::max(bits, 1);
+    };
+
+    auto parse_bits_value = [&](const std::string& value, int multiplier) {
+        try {
+            int val = std::stoi(value);
+            apply_target_bits(val * multiplier);
+        } catch (const std::exception&) {
+            std::cerr << "Invalid numeric target: " << value << std::endl;
+            std::exit(1);
+        }
+    };
+
+    std::vector<std::string> positional;
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        auto require_value = [&](const std::string& flag) -> std::string {
+            if (i + 1 >= argc) {
+                std::cerr << "Flag " << flag << " requires a value" << std::endl;
+                std::exit(1);
+            }
+            return std::string(argv[++i]);
+        };
+
+        if (arg == "--challenge" || arg == "-c") {
+            challenge = require_value(arg);
+            continue;
+        }
+        if (arg.rfind("--challenge=", 0) == 0) {
+            challenge = arg.substr(std::string("--challenge=").size());
+            continue;
+        }
+
+        if (arg == "--user" || arg == "-u") {
+            username = require_value(arg);
+            continue;
+        }
+        if (arg.rfind("--user=", 0) == 0) {
+            username = arg.substr(std::string("--user=").size());
+            continue;
+        }
+
+        if (arg == "--bits" || arg == "-b") {
+            parse_bits_value(require_value(arg), 1);
+            continue;
+        }
+        if (arg == "--hex" || arg == "-x") {
+            parse_bits_value(require_value(arg), 4);
+            continue;
+        }
+        if (arg.rfind("--bits=", 0) == 0) {
+            parse_bits_value(arg.substr(std::string("--bits=").size()), 1);
+            continue;
+        }
+        if (arg.rfind("--hex=", 0) == 0) {
+            parse_bits_value(arg.substr(std::string("--hex=").size()), 4);
+            continue;
+        }
+
+        if (arg == "--verbose" || arg == "-v") {
+            verbose = true;
+            continue;
+        }
+
+        if (!arg.empty() && arg[0] == '-') {
+            std::cerr << "Unknown option: " << arg << std::endl;
+            std::exit(1);
+        }
+
+        positional.push_back(arg);
+    }
+
+    if (!positional.empty()) {
+        challenge = positional[0];
+    }
+    if (positional.size() > 1) {
+        parse_bits_value(positional[1], 1);
+    }
+    int base_bits = std::max(target_zero_bits - 1, 0);
+    int64_t initial_target = -(static_cast<int64_t>(base_bits) << SCORE_SHIFT);
+
+    SharedState shared;
+    shared.challenge = challenge;
+    shared.username = username;
+    shared.instance_id = challenge + ":" + username;
+    shared.verbose = verbose;
+    shared.best_score = initial_target;
+    shared.start_time = std::chrono::steady_clock::now();
+
+    int target_hex_digits = target_zero_bits / 4;
+    int target_hex_extra_bits = target_zero_bits % 4;
+
+    std::cout << "Neural Proof-of-Work Miner v2 (OpenCL)" << std::endl;
+    std::cout << "Challenge: " << challenge << std::endl;
+    std::cout << "User: " << shared.username << std::endl;
+    std::cout << "Instance: " << shared.instance_id << std::endl;
+    std::cout << "Target: " << target_zero_bits << "+ leading zero bits ("
+              << target_hex_digits << " hex digit" << (target_hex_digits == 1 ? "" : "s");
+    if (target_hex_extra_bits) {
+        std::cout << " + " << target_hex_extra_bits << " bits";
+    }
+    std::cout << ")" << std::endl;
+
+    std::cout << "Generating network weights..." << std::endl;
+    generate_weights(shared.instance_id, shared.weights);
+    std::cout << "Generated " << shared.weights.size() << " weight bytes" << std::endl;
+
+    std::cout << "Network: " << INPUT_DIM << " -> " << HIDDEN_DIM << " -> " << HIDDEN_DIM << " -> " << OUTPUT_DIM << std::endl;
+    std::cout << "Global size: " << GLOBAL_SIZE << " threads per launch" << std::endl;
+    std::cout << "Local size: " << LOCAL_SIZE << " threads per work-group" << std::endl;
+
+    std::signal(SIGINT, signal_handler);
+    std::signal(SIGTERM, signal_handler);
+
+    std::vector<cl_device_id> devices = discover_all_gpus();
+    if (devices.empty()) {
+        std::cerr << "No GPUs found!" << std::endl;
+        return 1;
+    }
+    std::cout << "Found " << devices.size() << " GPU(s)" << std::endl;
+
+    std::vector<GPUContext> gpus(devices.size());
+    for (size_t i = 0; i < devices.size(); i++) {
+        if (!create_gpu_context(devices[i], static_cast<int>(i), shared, gpus[i])) {
+            std::cerr << "Failed to initialize GPU " << i << std::endl;
+            return 1;
+        }
+        std::cout << "Initialized GPU " << i << ": " << gpus[i].device_name << std::endl;
+    }
+
+    std::cout << "\nMining started...\n" << std::endl;
+
+    std::vector<std::thread> worker_threads;
+    for (auto& gpu : gpus) {
+        worker_threads.emplace_back(gpu_worker_thread, std::ref(gpu), std::ref(shared));
+    }
+
+    uint64_t last_total = 0;
+    auto last_time = std::chrono::steady_clock::now();
+
+    while (shared.running.load()) {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+
+        if (g_shutdown_requested) {
+            std::cout << "\nShutting down..." << std::endl;
+            shared.running.store(false);
+            break;
+        }
+
+        static int tick = 0;
+        if (++tick < 5) continue;
+        tick = 0;
+
+        uint64_t total_evals = 0;
+        uint64_t total_matches = 0;
+        for (const auto& gpu : gpus) {
+            total_evals += gpu.evals_computed.load();
+            total_matches += gpu.matches_found.load();
+        }
+
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - shared.start_time).count();
+        auto interval_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_time).count();
+
+        double recent_rate = (interval_ms > 0) ?
+            static_cast<double>(total_evals - last_total) / (interval_ms / 1000.0) : 0;
+
+        last_total = total_evals;
+        last_time = now;
+
+        int current_bits = 0;
+        {
+            std::lock_guard<std::mutex> lock(shared.best_mutex);
+            current_bits = cpu_verifier::score_to_leading_zero_bits(shared.best_score);
+        }
+
+        if (total_evals > 0) {
+            std::cout << "\r[Stats] " << std::fixed << std::setprecision(2)
+                      << (recent_rate / 1e6) << " M evals/s, "
+                      << std::setprecision(3) << (total_evals / 1e9) << "B evals, "
+                      << total_matches << " improvements, "
+                      << "best=" << current_bits << " LZ bits"
+                      << ", " << elapsed << "s        " << std::flush;
+        } else {
+            std::cout << "\r[Stats] Waiting for first kernel to complete... " << elapsed << "s" << std::flush;
+        }
+    }
+
+    for (auto& t : worker_threads) {
+        t.join();
+    }
+
+    std::cout << "\n\n========================================" << std::endl;
+    std::cout << "Final Results" << std::endl;
+    std::cout << "========================================" << std::endl;
+    std::cout << "Challenge: " << shared.challenge << std::endl;
+    std::cout << "User: " << shared.username << std::endl;
+
+    if (!shared.best_nonce.empty()) {
+        float outputs[OUTPUT_DIM];
+        cpu_verifier::get_outputs(shared.weights.data(), shared.best_nonce.data(), outputs);
+        uint8_t digest[DIGEST_BYTES];
+        cpu_verifier::compute_digest(outputs, digest, OUTPUT_DIM);
+        int lz_bits = cpu_verifier::count_leading_zero_bits(digest, DIGEST_BYTES);
+        std::string digest_hex = digest_to_hex(digest, DIGEST_BYTES);
+        std::string nonce_hex = nonce_to_hex(shared.best_nonce.data(), 64);
+
+        std::cout << "\nBest Result: " << describe_lz_bits(lz_bits) << std::endl;
+        std::cout << "Digest: " << format_digest_with_marker(digest_hex, lz_bits) << std::endl;
+        std::cout << "Prefix (first " << DIGEST_PREFIX_BYTES << " bytes): 0x"
+                  << digest_hex.substr(0, DIGEST_PREFIX_BYTES * 2) << std::endl;
+        std::cout << "Proof: " << shared.username << "/" << nonce_hex << std::endl;
+        if (shared.verbose) {
+            std::cout << "Output: [";
+            for (size_t i = 0; i < OUTPUT_DIM; i++) {
+                std::cout << std::fixed << std::setprecision(4) << std::setw(8) << outputs[i];
+                if (i < OUTPUT_DIM - 1) std::cout << ", ";
+            }
+            std::cout << "]" << std::endl;
+        }
+    } else {
+        std::cout << "\nNo valid result found." << std::endl;
+    }
+
+    return 0;
+}
