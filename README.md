@@ -4,7 +4,7 @@ GPU proof-of-work using FP32 neural network inference.
 
 ## How it works
 
-1. Username → SHA-256 → deterministic int8 weights (~148KB)
+1. Global epoch string ("epoch0") → SHA-256 → deterministic int8 weights (~148KB)
 2. Random 64-byte nonce → network input (32 floats)
 3. Forward pass: 32 → 256 → 256 → 256 → 32 MLP with ReLU
 4. Output → SipHash-2-4 → 32-byte digest
@@ -46,4 +46,4 @@ Options:
 username/nonce → digest
 ```
 
-Anyone can verify by deriving weights from the username, running the forward pass with the nonce, and counting leading zeros in the digest.
+Anyone can verify by deriving weights from the epoch, running the forward pass with the nonce, and counting leading zeros in the digest.

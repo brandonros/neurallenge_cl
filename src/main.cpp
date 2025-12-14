@@ -183,7 +183,7 @@ uint64_t siphash_2_4_132(const uint8_t* data, uint64_t k0, uint64_t k1) {
     return v0 ^ v1 ^ v2 ^ v3;
 }
 
-// SipHash keys defined in neurallenge_config.h
+// SipHash keys defined in config.h
 
 void compute_digest(const float* output, uint8_t* digest, size_t dim) {
     // Serialize q16 integers directly into SipHash input buffer
@@ -271,11 +271,6 @@ void forward_pass(const int8_t* weights, const uint8_t* nonce, float* output) {
                   hidden2, hidden3, HIDDEN_DIM, HIDDEN_DIM, true);
     layer_forward(weights + W4_OFFSET, weights + B4_OFFSET,
                   hidden3, output, HIDDEN_DIM, OUTPUT_DIM, false);
-}
-
-// Get raw outputs for display (alias for forward_pass)
-void get_outputs(const int8_t* weights, const uint8_t* nonce, float* out) {
-    forward_pass(weights, nonce, out);
 }
 
 // Full forward pass - returns integer score
@@ -468,17 +463,13 @@ struct GPUContext {
 // Utility Functions
 // ============================================================================
 
-std::string nonce_to_hex(const uint8_t* nonce, size_t len) {
+std::string bytes_to_hex(const uint8_t* data, size_t len) {
     std::stringstream ss;
     ss << std::hex << std::setfill('0');
     for (size_t i = 0; i < len; i++) {
-        ss << std::setw(2) << static_cast<int>(nonce[i]);
+        ss << std::setw(2) << static_cast<int>(data[i]);
     }
     return ss.str();
-}
-
-std::string digest_to_hex(const uint8_t* digest, size_t len) {
-    return nonce_to_hex(digest, len);
 }
 
 std::string describe_lz_bits(int bits) {
@@ -707,12 +698,12 @@ void gpu_worker_thread(GPUContext& ctx, SharedState& shared) {
                 std::lock_guard<std::mutex> lock(shared.best_mutex);
                 if (cpu_score < shared.best_score) {
                     float outputs[OUTPUT_DIM];
-                    cpu_verifier::get_outputs(shared.weights.data(), batch_best_nonce, outputs);
+                    cpu_verifier::forward_pass(shared.weights.data(), batch_best_nonce, outputs);
                     uint8_t digest[DIGEST_BYTES];
                     cpu_verifier::compute_digest(outputs, digest, OUTPUT_DIM);
                     int lz_bits = cpu_verifier::count_leading_zero_bits(digest, DIGEST_BYTES);
-                    std::string digest_hex = digest_to_hex(digest, DIGEST_BYTES);
-                    std::string nonce_hex = nonce_to_hex(batch_best_nonce, NONCE_BYTES);
+                    std::string digest_hex = bytes_to_hex(digest, DIGEST_BYTES);
+                    std::string nonce_hex = bytes_to_hex(batch_best_nonce, NONCE_BYTES);
 
                     shared.best_score = cpu_score;
                     shared.best_nonce.assign(batch_best_nonce, batch_best_nonce + NONCE_BYTES);
@@ -770,7 +761,7 @@ void setup_fp_environment() {
 // Golden Vector Test - Verify GPU/CPU determinism at startup
 // ============================================================================
 
-bool run_determinism_test(GPUContext& ctx, const SharedState& shared) {
+bool run_determinism_test(const SharedState& shared) {
     // Generate a test nonce deterministically from the username
     uint8_t test_nonce[NONCE_BYTES];
     uint8_t hash_out[32];
@@ -785,7 +776,7 @@ bool run_determinism_test(GPUContext& ctx, const SharedState& shared) {
     // CPU computation
     int64_t cpu_score = cpu_verifier::forward(shared.weights.data(), test_nonce);
     float cpu_outputs[OUTPUT_DIM];
-    cpu_verifier::get_outputs(shared.weights.data(), test_nonce, cpu_outputs);
+    cpu_verifier::forward_pass(shared.weights.data(), test_nonce, cpu_outputs);
     uint8_t digest[DIGEST_BYTES];
     cpu_verifier::compute_digest(cpu_outputs, digest, OUTPUT_DIM);
     int cpu_bits = cpu_verifier::count_leading_zero_bits(digest, DIGEST_BYTES);
@@ -817,7 +808,7 @@ bool run_determinism_test(GPUContext& ctx, const SharedState& shared) {
         }
     }
 
-    std::string digest_hex = digest_to_hex(digest, DIGEST_BYTES);
+    std::string digest_hex = bytes_to_hex(digest, DIGEST_BYTES);
     std::cout << "[Test] CPU determinism check PASSED" << std::endl;
     std::cout << "[Test] Test nonce digest: " << format_digest_with_marker(digest_hex, cpu_bits)
               << " (" << cpu_bits << " LZ bits)" << std::endl;
@@ -959,7 +950,7 @@ int main(int argc, char* argv[]) {
     }
 
     // Run determinism test to verify CPU consistency
-    if (!run_determinism_test(gpus[0], shared)) {
+    if (!run_determinism_test(shared)) {
         std::cerr << "Determinism test failed! Aborting." << std::endl;
         return 1;
     }
@@ -1041,12 +1032,12 @@ int main(int argc, char* argv[]) {
 
     if (!shared.best_nonce.empty()) {
         float outputs[OUTPUT_DIM];
-        cpu_verifier::get_outputs(shared.weights.data(), shared.best_nonce.data(), outputs);
+        cpu_verifier::forward_pass(shared.weights.data(), shared.best_nonce.data(), outputs);
         uint8_t digest[DIGEST_BYTES];
         cpu_verifier::compute_digest(outputs, digest, OUTPUT_DIM);
         int lz_bits = cpu_verifier::count_leading_zero_bits(digest, DIGEST_BYTES);
-        std::string digest_hex = digest_to_hex(digest, DIGEST_BYTES);
-        std::string nonce_hex = nonce_to_hex(shared.best_nonce.data(), NONCE_BYTES);
+        std::string digest_hex = bytes_to_hex(digest, DIGEST_BYTES);
+        std::string nonce_hex = bytes_to_hex(shared.best_nonce.data(), NONCE_BYTES);
 
         std::cout << "\nBest Result: " << describe_lz_bits(lz_bits) << std::endl;
         std::cout << "Digest: " << format_digest_with_marker(digest_hex, lz_bits) << std::endl;
