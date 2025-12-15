@@ -58,11 +58,25 @@ inline float get_weight(__global const char* weights, uint idx) {
     return (float)weights[idx] * WEIGHT_SCALE;
 }
 
+// Vectorized weight conversion - convert 8 chars to 8 floats
+inline void weights_to_floats8(char8 w, float* out) {
+    out[0] = (float)w.s0 * WEIGHT_SCALE;
+    out[1] = (float)w.s1 * WEIGHT_SCALE;
+    out[2] = (float)w.s2 * WEIGHT_SCALE;
+    out[3] = (float)w.s3 * WEIGHT_SCALE;
+    out[4] = (float)w.s4 * WEIGHT_SCALE;
+    out[5] = (float)w.s5 * WEIGHT_SCALE;
+    out[6] = (float)w.s6 * WEIGHT_SCALE;
+    out[7] = (float)w.s7 * WEIGHT_SCALE;
+}
+
 // ============================================================================
-// Matrix-Vector Multiply (scalar for determinism)
+// Matrix-Vector Multiply - Vectorized for better memory throughput
 // ============================================================================
 
 // Computes one output element: dot(W[row,:], input) + bias
+// Uses 8-wide vector loads for better memory bandwidth utilization
+// Maintains exact sequential accumulation order for determinism
 inline float matmul_row(
     __global const char* W,      // Row of weights [in_dim]
     __global const char* bias,   // Single bias value
@@ -70,14 +84,81 @@ inline float matmul_row(
     uint in_dim
 ) {
     float sum = 0.0f;
+    float wf[8];
 
-    for (uint i = 0; i < in_dim; i++) {
-        float prod = get_weight(W, i) * input[i];
-        sum = sum + prod;
+    // Process 32 elements at a time (4x vload8), then quantize
+    // Maintains exact sequential accumulation order: sum = ((sum + a) + b) + c ...
+    uint i = 0;
+    for (; i + 32 <= in_dim; i += 32) {
+        // Load weights 0-7 with single memory transaction
+        char8 w0 = vload8(0, W + i);
+        weights_to_floats8(w0, wf);
+        sum = sum + wf[0] * input[i+0];
+        sum = sum + wf[1] * input[i+1];
+        sum = sum + wf[2] * input[i+2];
+        sum = sum + wf[3] * input[i+3];
+        sum = sum + wf[4] * input[i+4];
+        sum = sum + wf[5] * input[i+5];
+        sum = sum + wf[6] * input[i+6];
+        sum = sum + wf[7] * input[i+7];
 
-        if ((i & 31u) == 31u) {
-            sum = q16(sum);
-        }
+        // Load weights 8-15
+        char8 w1 = vload8(0, W + i + 8);
+        weights_to_floats8(w1, wf);
+        sum = sum + wf[0] * input[i+8];
+        sum = sum + wf[1] * input[i+9];
+        sum = sum + wf[2] * input[i+10];
+        sum = sum + wf[3] * input[i+11];
+        sum = sum + wf[4] * input[i+12];
+        sum = sum + wf[5] * input[i+13];
+        sum = sum + wf[6] * input[i+14];
+        sum = sum + wf[7] * input[i+15];
+
+        // Load weights 16-23
+        char8 w2 = vload8(0, W + i + 16);
+        weights_to_floats8(w2, wf);
+        sum = sum + wf[0] * input[i+16];
+        sum = sum + wf[1] * input[i+17];
+        sum = sum + wf[2] * input[i+18];
+        sum = sum + wf[3] * input[i+19];
+        sum = sum + wf[4] * input[i+20];
+        sum = sum + wf[5] * input[i+21];
+        sum = sum + wf[6] * input[i+22];
+        sum = sum + wf[7] * input[i+23];
+
+        // Load weights 24-31
+        char8 w3 = vload8(0, W + i + 24);
+        weights_to_floats8(w3, wf);
+        sum = sum + wf[0] * input[i+24];
+        sum = sum + wf[1] * input[i+25];
+        sum = sum + wf[2] * input[i+26];
+        sum = sum + wf[3] * input[i+27];
+        sum = sum + wf[4] * input[i+28];
+        sum = sum + wf[5] * input[i+29];
+        sum = sum + wf[6] * input[i+30];
+        sum = sum + wf[7] * input[i+31];
+
+        // Quantize every 32 elements (same as original)
+        sum = q16(sum);
+    }
+
+    // Handle remaining elements (for in_dim not divisible by 32, e.g., INPUT_DIM=32)
+    // Process in chunks of 8 with sequential accumulation
+    for (; i + 8 <= in_dim; i += 8) {
+        char8 w = vload8(0, W + i);
+        weights_to_floats8(w, wf);
+        sum = sum + wf[0] * input[i+0];
+        sum = sum + wf[1] * input[i+1];
+        sum = sum + wf[2] * input[i+2];
+        sum = sum + wf[3] * input[i+3];
+        sum = sum + wf[4] * input[i+4];
+        sum = sum + wf[5] * input[i+5];
+        sum = sum + wf[6] * input[i+6];
+        sum = sum + wf[7] * input[i+7];
+    }
+    // Remaining < 8 elements (scalar)
+    for (; i < in_dim; i++) {
+        sum = sum + get_weight(W, i) * input[i];
     }
 
     sum += (float)(*bias) * WEIGHT_SCALE;

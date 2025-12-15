@@ -2,11 +2,9 @@ CC=g++
 
 # Configuration
 DEFAULT_USERNAME ?= brandonros
-# Tuned for ~100-500ms kernel dispatch (better interactivity + debugging)
-# Reduce GLOBAL_SIZE or HASHES_PER_THREAD if kernels take too long
-GLOBAL_SIZE ?= 16384
+GLOBAL_SIZE ?= 131072
 LOCAL_SIZE ?= 64
-HASHES_PER_THREAD ?= 8
+HASHES_PER_THREAD ?= 128
 
 CDEFINES=-DCL_TARGET_OPENCL_VERSION=300 \
          -DDEFAULT_USERNAME=\"$(DEFAULT_USERNAME)\" \

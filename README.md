@@ -48,10 +48,10 @@ Options:
 ## Verifying a proof
 
 ```bash
-# Real example (22 bits):
-./output/neurallenge --verify "brandonros//okcqJqhGz46ri7Z"
-# Digest: 00000|28ff4e8e72bf55ce581eb5e24470208380eb1d3d7f349b1734e8b5a4e87
-# Result: 22 bits
+# Real example:
+./output/neurallenge --verify "brandonros/+VzOvb7Xt1dgzCaj"
+# Digest: 00000000|2e958523c2f692c0289efdcdc50b924b06cfe6ada46109e318c0be7e
+# Result: 34 bits
 
 # ANY string works as a nonce - be creative!
 ./output/neurallenge --verify "brandonros/hello world"
