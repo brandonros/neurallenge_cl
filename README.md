@@ -49,9 +49,9 @@ Options:
 
 ```bash
 # Real example:
-./output/neurallenge --verify "brandonros/+VzOvb7Xt1dgzCaj"
-# Digest: 00000000|2e958523c2f692c0289efdcdc50b924b06cfe6ada46109e318c0be7e
-# Result: 34 bits
+./output/neurallenge --verify "brandonros/RHKVmOMCFoRTJdM+"
+# Digest: 000000000|9a1bf92496c3af9482ca706a037417ed4764f81400066b30144832c
+# Result: 36 bits
 
 # ANY string works as a nonce - be creative!
 ./output/neurallenge --verify "brandonros/hello world"

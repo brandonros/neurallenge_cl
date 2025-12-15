@@ -11,9 +11,9 @@ CC=g++
 #   - Higher = better weight cache reuse, fewer kernel launches
 #   - Too high = longer kernel time, less responsive target updates
 DEFAULT_USERNAME ?= brandonros
-GLOBAL_SIZE ?= 262144
+GLOBAL_SIZE ?= 131072
 LOCAL_SIZE ?= 128
-HASHES_PER_THREAD ?= 256
+HASHES_PER_THREAD ?= 128
 
 CDEFINES=-DCL_TARGET_OPENCL_VERSION=300 \
          -DDEFAULT_USERNAME=\"$(DEFAULT_USERNAME)\" \

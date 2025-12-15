@@ -465,7 +465,6 @@ struct GPUContext {
     std::atomic<uint64_t> evals_computed{0};
     std::atomic<uint64_t> matches_found{0};
     std::atomic<uint64_t> launch_counter{0};
-    std::atomic<uint64_t> total_kernel_time_us{0};  // Total kernel time in microseconds
 };
 
 // ============================================================================
@@ -674,6 +673,9 @@ bool create_gpu_context(cl_device_id device, int device_index, const SharedState
 
 // Process results from a completed kernel
 void process_kernel_results(GPUContext& ctx, SharedState& shared, ResultBuffer& buf) {
+    // Count evals at completion time for accurate rate measurement
+    ctx.evals_computed.fetch_add(static_cast<uint64_t>(GLOBAL_SIZE) * HASHES_PER_THREAD);
+
     cl_uint found_count;
     clEnqueueReadBuffer(ctx.queue, buf.found_count_buf, CL_TRUE, 0, sizeof(cl_uint), &found_count, 0, nullptr, nullptr);
 
@@ -801,7 +803,6 @@ void gpu_worker_thread(GPUContext& ctx, SharedState& shared) {
         clSetKernelArg(ctx.kernel, 6, sizeof(cl_mem), &buf.found_nonces_buf);
 
         // Launch kernel with event for completion tracking
-        auto kernel_start = std::chrono::steady_clock::now();
         cl_int err = clEnqueueNDRangeKernel(ctx.queue, ctx.kernel, 1, nullptr, &global_size, &local_size, 0, nullptr, &buf.kernel_done);
         if (err != CL_SUCCESS) {
             std::cerr << "[GPU " << ctx.device_index << "] Kernel error: " << err << std::endl;
@@ -809,12 +810,7 @@ void gpu_worker_thread(GPUContext& ctx, SharedState& shared) {
         }
 
         buf.pending = true;
-        ctx.evals_computed.fetch_add(static_cast<uint64_t>(GLOBAL_SIZE) * HASHES_PER_THREAD);
-
-        // Estimate kernel time (will be more accurate after first iteration)
-        auto kernel_us = std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::steady_clock::now() - kernel_start).count();
-        ctx.total_kernel_time_us.fetch_add(static_cast<uint64_t>(kernel_us) + 2000000);  // Add ~2s estimate
+        // Note: evals_computed is incremented in process_kernel_results after completion
 
         // Swap to other buffer for next iteration
         ctx.current_buffer = 1 - ctx.current_buffer;
@@ -1109,12 +1105,18 @@ int main(int argc, char* argv[]) {
         worker_threads.emplace_back(gpu_worker_thread, std::ref(gpu), std::ref(shared));
     }
 
+    // Stats tracking with exponential moving average for smooth reporting
     uint64_t last_total = 0;
     auto last_time = std::chrono::steady_clock::now();
-    int stats_tick = 0;
+    double smoothed_rate = 0.0;  // EMA of evals/s
+    constexpr double EMA_ALPHA = 0.1;  // Smoothing factor (0.1 = heavy smoothing)
+    constexpr int WARMUP_SAMPLES = 5;  // Discard first N samples for accurate measurement
+    int sample_count = 0;
+    uint64_t post_warmup_evals = 0;  // Evals counted after warmup
+    auto post_warmup_time = std::chrono::steady_clock::now();
 
     while (shared.running.load()) {
-        std::this_thread::sleep_for(std::chrono::seconds(1));
+        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
 
         if (g_shutdown_requested) {
             std::cout << "\nShutting down..." << std::endl;
@@ -1122,49 +1124,85 @@ int main(int argc, char* argv[]) {
             break;
         }
 
-        // Only update stats display every 5 seconds
-        if (++stats_tick < 5) continue;
-        stats_tick = 0;
-
+        // Gather stats from all GPUs
         uint64_t total_evals = 0;
         uint64_t total_matches = 0;
         uint64_t total_launches = 0;
-        uint64_t total_kernel_time_us = 0;
         for (const auto& gpu : gpus) {
             total_evals += gpu.evals_computed.load();
             total_matches += gpu.matches_found.load();
             total_launches += gpu.launch_counter.load();
-            total_kernel_time_us += gpu.total_kernel_time_us.load();
         }
 
         auto now = std::chrono::steady_clock::now();
-        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - shared.start_time).count();
-        auto interval_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_time).count();
+        auto elapsed_total = std::chrono::duration_cast<std::chrono::seconds>(now - shared.start_time).count();
+        auto interval_us = std::chrono::duration_cast<std::chrono::microseconds>(now - last_time).count();
 
-        double recent_rate = (interval_ms > 0) ?
-            static_cast<double>(total_evals - last_total) / (interval_ms / 1000.0) : 0;
+        // Calculate instantaneous rate
+        double instant_rate = 0.0;
+        if (interval_us > 0 && total_evals > last_total) {
+            instant_rate = static_cast<double>(total_evals - last_total) / (interval_us / 1e6);
+        }
+
+        // Track samples and handle warmup
+        if (total_evals > last_total) {
+            sample_count++;
+        }
+        bool in_warmup = (sample_count <= WARMUP_SAMPLES);
+
+        // Update exponential moving average (only after warmup)
+        if (!in_warmup && instant_rate > 0) {
+            if (smoothed_rate == 0.0) {
+                // First post-warmup sample - initialize EMA and tracking
+                smoothed_rate = instant_rate;
+                post_warmup_evals = total_evals;
+                post_warmup_time = now;
+            } else {
+                smoothed_rate = EMA_ALPHA * instant_rate + (1.0 - EMA_ALPHA) * smoothed_rate;
+            }
+        }
 
         last_total = total_evals;
         last_time = now;
 
+        // Get current best
         int current_bits = 0;
         {
             std::lock_guard<std::mutex> lock(shared.best_mutex);
             current_bits = cpu_verifier::score_to_lz_bits(shared.best_score);
         }
 
+        // Calculate average rate (post-warmup for accuracy)
+        double avg_rate = 0.0;
+        if (!in_warmup) {
+            auto post_warmup_elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - post_warmup_time).count();
+            uint64_t post_warmup_delta = total_evals - post_warmup_evals;
+            if (post_warmup_elapsed > 0) {
+                avg_rate = static_cast<double>(post_warmup_delta) / post_warmup_elapsed;
+            }
+        }
+
         if (total_evals > 0) {
-            double avg_kernel_ms = (total_launches > 0) ?
-                static_cast<double>(total_kernel_time_us) / total_launches / 1000.0 : 0;
-            std::cout << "\r[Stats] " << std::fixed << std::setprecision(2)
-                      << (recent_rate / 1e6) << " M evals/s, "
-                      << std::setprecision(3) << (total_evals / 1e9) << "B evals, "
-                      << total_matches << " improvements, "
-                      << "best=" << current_bits << " LZ bits, "
-                      << std::setprecision(1) << avg_kernel_ms << "ms/kernel"
-                      << ", " << elapsed << "s        " << std::flush;
+            if (in_warmup) {
+                std::cout << "\r[Warmup " << sample_count << "/" << WARMUP_SAMPLES << "] "
+                          << std::fixed << std::setprecision(2) << (instant_rate / 1e6) << " M/s"
+                          << " | " << std::setprecision(3) << (total_evals / 1e9) << "B total"
+                          << " | best=" << current_bits << " bits"
+                          << " | " << elapsed_total << "s"
+                          << "        " << std::flush;
+            } else {
+                std::cout << "\r[Stats] " << std::fixed << std::setprecision(2)
+                          << (smoothed_rate / 1e6) << " M/s"
+                          << " (avg " << std::setprecision(2) << (avg_rate / 1e6) << ")"
+                          << " | " << std::setprecision(3) << (total_evals / 1e9) << "B total"
+                          << " | best=" << current_bits << " bits"
+                          << " | " << total_matches << " hits"
+                          << " | " << total_launches << " batches"
+                          << " | " << elapsed_total << "s"
+                          << "        " << std::flush;
+            }
         } else {
-            std::cout << "\r[Stats] Waiting for first kernel to complete... " << elapsed << "s" << std::flush;
+            std::cout << "\r[Stats] Waiting for first kernel... " << elapsed_total << "s" << std::flush;
         }
     }
 
