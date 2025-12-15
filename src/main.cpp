@@ -439,6 +439,15 @@ struct SharedState {
 // GPU Context
 // ============================================================================
 
+// Double-buffered result structure for pipelined execution
+struct ResultBuffer {
+    cl_mem found_count_buf;
+    cl_mem found_scores_buf;
+    cl_mem found_nonces_buf;
+    cl_event kernel_done;
+    bool pending;  // Has a kernel been launched on this buffer?
+};
+
 struct GPUContext {
     int device_index;
     std::string device_name;
@@ -448,9 +457,11 @@ struct GPUContext {
     cl_program program;
     cl_kernel kernel;
     cl_mem weights_buf;
-    cl_mem found_count_buf;
-    cl_mem found_scores_buf;
-    cl_mem found_nonces_buf;
+
+    // Double-buffered result buffers for pipelining
+    ResultBuffer buffers[2];
+    int current_buffer;
+
     std::atomic<uint64_t> evals_computed{0};
     std::atomic<uint64_t> matches_found{0};
     std::atomic<uint64_t> launch_counter{0};
@@ -632,23 +643,27 @@ bool create_gpu_context(cl_device_id device, int device_index, const SharedState
         return false;
     }
 
-    ctx.found_count_buf = clCreateBuffer(ctx.context, CL_MEM_READ_WRITE, sizeof(cl_uint), nullptr, &err);
-    ctx.found_scores_buf = clCreateBuffer(ctx.context, CL_MEM_WRITE_ONLY, MAX_RESULTS * sizeof(cl_ulong), nullptr, &err);
-    ctx.found_nonces_buf = clCreateBuffer(ctx.context, CL_MEM_WRITE_ONLY, MAX_RESULTS * NONCE_BYTES, nullptr, &err);
+    // Create double-buffered result buffers for pipelining
+    for (int i = 0; i < 2; i++) {
+        ctx.buffers[i].found_count_buf = clCreateBuffer(ctx.context, CL_MEM_READ_WRITE, sizeof(cl_uint), nullptr, &err);
+        ctx.buffers[i].found_scores_buf = clCreateBuffer(ctx.context, CL_MEM_WRITE_ONLY, MAX_RESULTS * sizeof(cl_ulong), nullptr, &err);
+        ctx.buffers[i].found_nonces_buf = clCreateBuffer(ctx.context, CL_MEM_WRITE_ONLY, MAX_RESULTS * NONCE_BYTES, nullptr, &err);
+        ctx.buffers[i].kernel_done = nullptr;
+        ctx.buffers[i].pending = false;
 
-    if (err != CL_SUCCESS) {
-        std::cerr << "[GPU " << device_index << "] Failed to create result buffers: " << err << std::endl;
-        return false;
+        if (err != CL_SUCCESS) {
+            std::cerr << "[GPU " << device_index << "] Failed to create result buffers: " << err << std::endl;
+            return false;
+        }
     }
+    ctx.current_buffer = 0;
 
-    // Set static kernel args
+    // Set static kernel args (buffer args set per launch)
     clSetKernelArg(ctx.kernel, 0, sizeof(cl_mem), &ctx.weights_buf);
     // arg 1 (target_score) set per launch
     // arg 2 (seed_lo) set per launch
     // arg 3 (seed_hi) set per launch
-    clSetKernelArg(ctx.kernel, 4, sizeof(cl_mem), &ctx.found_count_buf);
-    clSetKernelArg(ctx.kernel, 5, sizeof(cl_mem), &ctx.found_scores_buf);
-    clSetKernelArg(ctx.kernel, 6, sizeof(cl_mem), &ctx.found_nonces_buf);
+    // args 4-6 (result buffers) set per launch for double-buffering
 
     return true;
 }
@@ -657,6 +672,83 @@ bool create_gpu_context(cl_device_id device, int device_index, const SharedState
 // GPU Worker Thread
 // ============================================================================
 
+// Process results from a completed kernel
+void process_kernel_results(GPUContext& ctx, SharedState& shared, ResultBuffer& buf) {
+    cl_uint found_count;
+    clEnqueueReadBuffer(ctx.queue, buf.found_count_buf, CL_TRUE, 0, sizeof(cl_uint), &found_count, 0, nullptr, nullptr);
+
+    if (found_count > 0) {
+        size_t results_to_read = std::min(static_cast<size_t>(found_count), static_cast<size_t>(MAX_RESULTS));
+
+        std::vector<uint64_t> all_scores(results_to_read);
+        std::vector<uint8_t> all_nonces(results_to_read * NONCE_BYTES);
+
+        clEnqueueReadBuffer(ctx.queue, buf.found_scores_buf, CL_TRUE, 0,
+                           results_to_read * sizeof(uint64_t), all_scores.data(), 0, nullptr, nullptr);
+        clEnqueueReadBuffer(ctx.queue, buf.found_nonces_buf, CL_TRUE, 0,
+                           results_to_read * NONCE_BYTES, all_nonces.data(), 0, nullptr, nullptr);
+
+        // Find best in batch (lowest score = best)
+        size_t best_idx = 0;
+        for (size_t i = 1; i < results_to_read; i++) {
+            if (all_scores[i] < all_scores[best_idx]) {
+                best_idx = i;
+            }
+        }
+
+        uint64_t batch_best_score = all_scores[best_idx];
+        uint8_t* batch_best_nonce = all_nonces.data() + best_idx * NONCE_BYTES;
+
+        // Verify on CPU - must match bit-exactly (consensus requirement)
+        uint64_t cpu_score = cpu_verifier::forward(shared.weights.data(), batch_best_nonce, NONCE_BYTES);
+
+        // Scores must match exactly - any difference is a determinism bug
+        if (cpu_score != batch_best_score) {
+            std::cerr << "[GPU " << ctx.device_index << "] CRITICAL: Score mismatch! "
+                      << "GPU=0x" << std::hex << batch_best_score
+                      << " CPU=0x" << cpu_score << std::dec << std::endl;
+            return;  // Reject mismatched results
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(shared.best_mutex);
+            if (cpu_score < shared.best_score) {
+                float outputs[OUTPUT_DIM];
+                cpu_verifier::forward_pass(shared.weights.data(), batch_best_nonce, NONCE_BYTES, outputs);
+                uint8_t digest[DIGEST_BYTES];
+                cpu_verifier::compute_digest(outputs, digest, OUTPUT_DIM);
+                int lz_bits = cpu_verifier::count_leading_zero_bits(digest, DIGEST_BYTES);
+                std::string digest_hex = bytes_to_hex(digest, DIGEST_BYTES);
+                std::string nonce_str(reinterpret_cast<char*>(batch_best_nonce), NONCE_BYTES);
+
+                shared.best_score = cpu_score;
+                shared.best_nonce.assign(batch_best_nonce, batch_best_nonce + NONCE_BYTES);
+                shared.best_digest.assign(digest, digest + DIGEST_BYTES);
+                ctx.matches_found.fetch_add(1);
+
+                auto now = std::chrono::steady_clock::now();
+                auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - shared.start_time).count();
+
+                std::cout << "\n[GPU " << ctx.device_index << "] NEW BEST: "
+                          << describe_lz_bits(lz_bits) << " | digest="
+                          << format_digest_with_marker(digest_hex, lz_bits) << std::endl;
+                std::cout << "  Proof: " << shared.username << "/" << nonce_str << std::endl;
+                if (shared.verbose) {
+                    std::cout << "  Output: [";
+                    for (size_t j = 0; j < OUTPUT_DIM; j++) {
+                        std::cout << std::fixed << std::setprecision(3)
+                                  << std::setw(7) << outputs[j];
+                        if (j < OUTPUT_DIM - 1) std::cout << ", ";
+                    }
+                    std::cout << "]" << std::endl;
+                }
+                std::cout << "  Time: " << elapsed << "s | Batch had " << found_count << " candidates" << std::endl;
+                std::cout << std::endl;
+            }
+        }
+    }
+}
+
 void gpu_worker_thread(GPUContext& ctx, SharedState& shared) {
     std::cout << "[GPU " << ctx.device_index << "] Started mining on " << ctx.device_name << std::endl;
 
@@ -664,7 +756,28 @@ void gpu_worker_thread(GPUContext& ctx, SharedState& shared) {
     std::random_device rd;
     std::mt19937 rng(rd());
 
+    size_t global_size = GLOBAL_SIZE;
+    size_t local_size = LOCAL_SIZE;
+
     while (shared.running.load()) {
+        // Get current buffer
+        ResultBuffer& buf = ctx.buffers[ctx.current_buffer];
+
+        // If there's a pending kernel on this buffer, wait for it and process results
+        if (buf.pending) {
+            clWaitForEvents(1, &buf.kernel_done);
+            clReleaseEvent(buf.kernel_done);
+            buf.kernel_done = nullptr;
+            buf.pending = false;
+
+            // Process results while next kernel could be running
+            process_kernel_results(ctx, shared, buf);
+        }
+
+        // Check if we should stop
+        if (!shared.running.load()) break;
+
+        // Get current target
         cl_ulong target_score;
         {
             std::lock_guard<std::mutex> lock(shared.best_mutex);
@@ -675,101 +788,43 @@ void gpu_worker_thread(GPUContext& ctx, SharedState& shared) {
         cl_uint seed_lo = rng();
         cl_uint seed_hi = rng();
 
+        // Reset found count
         cl_uint zero = 0;
-        clEnqueueWriteBuffer(ctx.queue, ctx.found_count_buf, CL_FALSE, 0, sizeof(cl_uint), &zero, 0, nullptr, nullptr);
+        clEnqueueWriteBuffer(ctx.queue, buf.found_count_buf, CL_FALSE, 0, sizeof(cl_uint), &zero, 0, nullptr, nullptr);
 
+        // Set kernel args including buffer-specific args
         clSetKernelArg(ctx.kernel, 1, sizeof(cl_ulong), &target_score);
         clSetKernelArg(ctx.kernel, 2, sizeof(cl_uint), &seed_lo);
         clSetKernelArg(ctx.kernel, 3, sizeof(cl_uint), &seed_hi);
+        clSetKernelArg(ctx.kernel, 4, sizeof(cl_mem), &buf.found_count_buf);
+        clSetKernelArg(ctx.kernel, 5, sizeof(cl_mem), &buf.found_scores_buf);
+        clSetKernelArg(ctx.kernel, 6, sizeof(cl_mem), &buf.found_nonces_buf);
 
-        size_t global_size = GLOBAL_SIZE;
-        size_t local_size = LOCAL_SIZE;
-
+        // Launch kernel with event for completion tracking
         auto kernel_start = std::chrono::steady_clock::now();
-        cl_int err = clEnqueueNDRangeKernel(ctx.queue, ctx.kernel, 1, nullptr, &global_size, &local_size, 0, nullptr, nullptr);
+        cl_int err = clEnqueueNDRangeKernel(ctx.queue, ctx.kernel, 1, nullptr, &global_size, &local_size, 0, nullptr, &buf.kernel_done);
         if (err != CL_SUCCESS) {
             std::cerr << "[GPU " << ctx.device_index << "] Kernel error: " << err << std::endl;
             break;
         }
 
-        clFinish(ctx.queue);
-        auto kernel_end = std::chrono::steady_clock::now();
-        auto kernel_us = std::chrono::duration_cast<std::chrono::microseconds>(kernel_end - kernel_start).count();
-        ctx.total_kernel_time_us.fetch_add(static_cast<uint64_t>(kernel_us));
+        buf.pending = true;
         ctx.evals_computed.fetch_add(static_cast<uint64_t>(GLOBAL_SIZE) * HASHES_PER_THREAD);
 
-        cl_uint found_count;
-        clEnqueueReadBuffer(ctx.queue, ctx.found_count_buf, CL_TRUE, 0, sizeof(cl_uint), &found_count, 0, nullptr, nullptr);
+        // Estimate kernel time (will be more accurate after first iteration)
+        auto kernel_us = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - kernel_start).count();
+        ctx.total_kernel_time_us.fetch_add(static_cast<uint64_t>(kernel_us) + 2000000);  // Add ~2s estimate
 
-        if (found_count > 0) {
-            size_t results_to_read = std::min(static_cast<size_t>(found_count), static_cast<size_t>(MAX_RESULTS));
+        // Swap to other buffer for next iteration
+        ctx.current_buffer = 1 - ctx.current_buffer;
+    }
 
-            std::vector<uint64_t> all_scores(results_to_read);
-            std::vector<uint8_t> all_nonces(results_to_read * NONCE_BYTES);
-
-            clEnqueueReadBuffer(ctx.queue, ctx.found_scores_buf, CL_TRUE, 0,
-                               results_to_read * sizeof(uint64_t), all_scores.data(), 0, nullptr, nullptr);
-            clEnqueueReadBuffer(ctx.queue, ctx.found_nonces_buf, CL_TRUE, 0,
-                               results_to_read * NONCE_BYTES, all_nonces.data(), 0, nullptr, nullptr);
-
-            // Find best in batch (lowest score = best)
-            size_t best_idx = 0;
-            for (size_t i = 1; i < results_to_read; i++) {
-                if (all_scores[i] < all_scores[best_idx]) {
-                    best_idx = i;
-                }
-            }
-
-            uint64_t batch_best_score = all_scores[best_idx];
-            uint8_t* batch_best_nonce = all_nonces.data() + best_idx * NONCE_BYTES;
-
-            // Verify on CPU - must match bit-exactly (consensus requirement)
-            uint64_t cpu_score = cpu_verifier::forward(shared.weights.data(), batch_best_nonce, NONCE_BYTES);
-
-            // Scores must match exactly - any difference is a determinism bug
-            if (cpu_score != batch_best_score) {
-                std::cerr << "[GPU " << ctx.device_index << "] CRITICAL: Score mismatch! "
-                          << "GPU=0x" << std::hex << batch_best_score
-                          << " CPU=0x" << cpu_score << std::dec << std::endl;
-                continue;  // Reject mismatched results
-            }
-
-            {
-                std::lock_guard<std::mutex> lock(shared.best_mutex);
-                if (cpu_score < shared.best_score) {
-                    float outputs[OUTPUT_DIM];
-                    cpu_verifier::forward_pass(shared.weights.data(), batch_best_nonce, NONCE_BYTES, outputs);
-                    uint8_t digest[DIGEST_BYTES];
-                    cpu_verifier::compute_digest(outputs, digest, OUTPUT_DIM);
-                    int lz_bits = cpu_verifier::count_leading_zero_bits(digest, DIGEST_BYTES);
-                    std::string digest_hex = bytes_to_hex(digest, DIGEST_BYTES);
-                    std::string nonce_str(reinterpret_cast<char*>(batch_best_nonce), NONCE_BYTES);
-
-                    shared.best_score = cpu_score;
-                    shared.best_nonce.assign(batch_best_nonce, batch_best_nonce + NONCE_BYTES);
-                    shared.best_digest.assign(digest, digest + DIGEST_BYTES);
-                    ctx.matches_found.fetch_add(1);
-
-                    auto now = std::chrono::steady_clock::now();
-                    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - shared.start_time).count();
-
-                    std::cout << "\n[GPU " << ctx.device_index << "] NEW BEST: "
-                              << describe_lz_bits(lz_bits) << " | digest="
-                              << format_digest_with_marker(digest_hex, lz_bits) << std::endl;
-                    std::cout << "  Proof: " << shared.username << "/" << nonce_str << std::endl;
-                    if (shared.verbose) {
-                        std::cout << "  Output: [";
-                        for (size_t i = 0; i < OUTPUT_DIM; i++) {
-                            std::cout << std::fixed << std::setprecision(3)
-                                      << std::setw(7) << outputs[i];
-                            if (i < OUTPUT_DIM - 1) std::cout << ", ";
-                        }
-                        std::cout << "]" << std::endl;
-                    }
-                    std::cout << "  Time: " << elapsed << "s | Batch had " << found_count << " candidates" << std::endl;
-                    std::cout << std::endl;
-                }
-            }
+    // Clean up any pending kernels
+    for (int i = 0; i < 2; i++) {
+        if (ctx.buffers[i].pending && ctx.buffers[i].kernel_done) {
+            clWaitForEvents(1, &ctx.buffers[i].kernel_done);
+            clReleaseEvent(ctx.buffers[i].kernel_done);
         }
     }
 

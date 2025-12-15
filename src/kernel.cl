@@ -177,6 +177,8 @@ inline void layer_forward(
     uint out_dim,
     int use_relu                 // 1 for hidden layers, 0 for output
 ) {
+    // Partial unroll - full unroll of 256 would be too aggressive
+    #pragma unroll 4
     for (uint i = 0; i < out_dim; i++) {
         float sum = matmul_row(W + i * in_dim, bias + i, input, in_dim);
         output[i] = use_relu ? fmax(0.0f, sum) : sum;
@@ -211,6 +213,7 @@ inline void sha256_short(const uchar* data, uint len, uchar* out) {
     uint w[16];
 
     // Clear w
+    #pragma unroll
     for (int i = 0; i < 16; i++) w[i] = 0;
 
     // Copy data (big-endian)
@@ -234,6 +237,7 @@ inline void sha256_short(const uchar* data, uint len, uchar* out) {
     uint e = H[4], f = H[5], g = H[6], h = H[7];
 
     // Rounds 0-15
+    #pragma unroll
     for (int i = 0; i < 16; i++) {
         uint t1 = h + SHA_BSIG1(e) + SHA_CH(e, f, g) + SHA256_K[i] + w[i];
         uint t2 = SHA_BSIG0(a) + SHA_MAJ(a, b, c);
@@ -242,6 +246,7 @@ inline void sha256_short(const uchar* data, uint len, uchar* out) {
     }
 
     // Rounds 16-63
+    #pragma unroll
     for (int i = 16; i < 64; i++) {
         int j = i & 0xF;
         w[j] = SHA_SSIG1(w[(j + 14) & 0xF]) + w[(j + 9) & 0xF] +
@@ -257,6 +262,7 @@ inline void sha256_short(const uchar* data, uint len, uchar* out) {
     H[4] += e; H[5] += f; H[6] += g; H[7] += h;
 
     // Output (big-endian)
+    #pragma unroll
     for (int i = 0; i < 8; i++) {
         out[i*4]     = (H[i] >> 24) & 0xFF;
         out[i*4 + 1] = (H[i] >> 16) & 0xFF;
@@ -271,7 +277,8 @@ inline void expand_nonce(const uchar* nonce, uint nonce_len, uchar* expanded) {
     uchar buf[NONCE_BYTES + 1];
 
     // Copy nonce and append suffix byte
-    for (uint i = 0; i < nonce_len; i++) {
+    #pragma unroll
+    for (uint i = 0; i < NONCE_BYTES; i++) {
         buf[i] = nonce[i];
     }
 
@@ -290,6 +297,7 @@ inline void expand_nonce(const uchar* nonce, uint nonce_len, uchar* expanded) {
 
 // Convert 64 expanded bytes to INPUT_DIM floats
 inline void expanded_to_input(const uchar* expanded, float* input) {
+    #pragma unroll
     for (int i = 0; i < INPUT_DIM; i++) {
         // Little-endian int16
         short val = (short)(expanded[i*2] | (expanded[i*2 + 1] << 8));
@@ -370,25 +378,32 @@ inline void sipround(ulong* v0, ulong* v1, ulong* v2, ulong* v3) {
     *v2 += *v1; *v1 = rotl64(*v1, 17); *v1 ^= *v2; *v2 = rotl64(*v2, 32);
 }
 
+// Load 8 bytes as little-endian uint64 using vector load
+inline ulong load_le64(const uchar* p) {
+    uchar8 bytes = vload8(0, p);
+    return (ulong)bytes.s0
+         | ((ulong)bytes.s1 << 8)
+         | ((ulong)bytes.s2 << 16)
+         | ((ulong)bytes.s3 << 24)
+         | ((ulong)bytes.s4 << 32)
+         | ((ulong)bytes.s5 << 40)
+         | ((ulong)bytes.s6 << 48)
+         | ((ulong)bytes.s7 << 56);
+}
+
 // SipHash-2-4 with 128-bit key, returns 64-bit hash
 // Specialized for 132-byte input (128 bytes data + 4 bytes domain separator)
+// Optimized with vector loads
 inline ulong siphash_2_4_132(const uchar* data, ulong k0, ulong k1) {
     ulong v0 = k0 ^ 0x736f6d6570736575UL;
     ulong v1 = k1 ^ 0x646f72616e646f6dUL;
     ulong v2 = k0 ^ 0x6c7967656e657261UL;
     ulong v3 = k1 ^ 0x7465646279746573UL;
 
-    // Process 16 full 8-byte blocks (128 bytes)
+    // Process 16 full 8-byte blocks (128 bytes) with vectorized loads
+    #pragma unroll 16
     for (int blk = 0; blk < 16; blk++) {
-        const uchar* p = data + blk * 8;
-        ulong m = (ulong)p[0]
-                | ((ulong)p[1] << 8)
-                | ((ulong)p[2] << 16)
-                | ((ulong)p[3] << 24)
-                | ((ulong)p[4] << 32)
-                | ((ulong)p[5] << 40)
-                | ((ulong)p[6] << 48)
-                | ((ulong)p[7] << 56);
+        ulong m = load_le64(data + blk * 8);
         v3 ^= m;
         sipround(&v0, &v1, &v2, &v3);
         sipround(&v0, &v1, &v2, &v3);
@@ -396,12 +411,12 @@ inline ulong siphash_2_4_132(const uchar* data, ulong k0, ulong k1) {
     }
 
     // Process final 4 bytes + length (132 = 0x84)
-    const uchar* p = data + 128;
+    uchar4 final4 = vload4(0, data + 128);
     ulong b = (132UL << 56)
-            | (ulong)p[0]
-            | ((ulong)p[1] << 8)
-            | ((ulong)p[2] << 16)
-            | ((ulong)p[3] << 24);
+            | (ulong)final4.s0
+            | ((ulong)final4.s1 << 8)
+            | ((ulong)final4.s2 << 16)
+            | ((ulong)final4.s3 << 24);
 
     v3 ^= b;
     sipround(&v0, &v1, &v2, &v3);
@@ -427,7 +442,8 @@ inline ulong siphash_2_4_132(const uchar* data, ulong k0, ulong k1) {
 inline void compute_digest(const float* output, uchar* digest, uint dim) {
     // Serialize q16 integers directly into SipHash input buffer
     uchar input[SIPHASH_INPUT_BYTES];
-    for (uint i = 0; i < dim; i++) {
+    #pragma unroll
+    for (uint i = 0; i < OUTPUT_DIM; i++) {
         int val = q16_to_int(output[i]);
         input[i * 4 + 0] = (uchar)(val & 0xFF);
         input[i * 4 + 1] = (uchar)((val >> 8) & 0xFF);
@@ -440,11 +456,13 @@ inline void compute_digest(const float* output, uchar* digest, uint dim) {
     input[SERIALIZED_OUTPUT_BYTES + 3] = 0;
 
     // Generate DIGEST_BYTES of digest using SipHash with domain separation
+    #pragma unroll
     for (uint block = 0; block < (DIGEST_BYTES / 8); block++) {
         input[SERIALIZED_OUTPUT_BYTES] = (uchar)block;
         ulong h = siphash_2_4_132(input, SIPHASH_K0, SIPHASH_K1);
 
         // Extract 8 bytes from hash (little-endian)
+        #pragma unroll
         for (int i = 0; i < 8; i++) {
             digest[block * 8 + i] = (uchar)((h >> (i * 8)) & 0xFF);
         }
@@ -453,14 +471,42 @@ inline void compute_digest(const float* output, uchar* digest, uint dim) {
 
 // Score = first 8 bytes of digest as big-endian uint64
 // Lower value = more leading zeros = better
+// Optimized: only computes block 0 of SipHash (the score bytes)
 inline ulong compute_score(const float* output, uint dim) {
-    uchar digest[DIGEST_BYTES];
-    compute_digest(output, digest, dim);
-    // Big-endian: first byte is most significant
-    return ((ulong)digest[0] << 56) | ((ulong)digest[1] << 48) |
-           ((ulong)digest[2] << 40) | ((ulong)digest[3] << 32) |
-           ((ulong)digest[4] << 24) | ((ulong)digest[5] << 16) |
-           ((ulong)digest[6] << 8)  | (ulong)digest[7];
+    // Serialize q16 integers directly into SipHash input buffer
+    uchar input[SIPHASH_INPUT_BYTES];
+    #pragma unroll
+    for (uint i = 0; i < OUTPUT_DIM; i++) {
+        int val = q16_to_int(output[i]);
+        input[i * 4 + 0] = (uchar)(val & 0xFF);
+        input[i * 4 + 1] = (uchar)((val >> 8) & 0xFF);
+        input[i * 4 + 2] = (uchar)((val >> 16) & 0xFF);
+        input[i * 4 + 3] = (uchar)((val >> 24) & 0xFF);
+    }
+    // Domain separator for block 0
+    input[SERIALIZED_OUTPUT_BYTES] = 0;
+    input[SERIALIZED_OUTPUT_BYTES + 1] = 0;
+    input[SERIALIZED_OUTPUT_BYTES + 2] = 0;
+    input[SERIALIZED_OUTPUT_BYTES + 3] = 0;
+
+    // Only compute first SipHash block (gives us first 8 bytes = score)
+    ulong h = siphash_2_4_132(input, SIPHASH_K0, SIPHASH_K1);
+
+    // Convert to big-endian score (lower = better)
+    // h is little-endian from SipHash, we want big-endian interpretation
+    uchar d0 = (uchar)(h & 0xFF);
+    uchar d1 = (uchar)((h >> 8) & 0xFF);
+    uchar d2 = (uchar)((h >> 16) & 0xFF);
+    uchar d3 = (uchar)((h >> 24) & 0xFF);
+    uchar d4 = (uchar)((h >> 32) & 0xFF);
+    uchar d5 = (uchar)((h >> 40) & 0xFF);
+    uchar d6 = (uchar)((h >> 48) & 0xFF);
+    uchar d7 = (uchar)((h >> 56) & 0xFF);
+
+    return ((ulong)d0 << 56) | ((ulong)d1 << 48) |
+           ((ulong)d2 << 40) | ((ulong)d3 << 32) |
+           ((ulong)d4 << 24) | ((ulong)d5 << 16) |
+           ((ulong)d6 << 8)  | (ulong)d7;
 }
 
 // ============================================================================
@@ -536,10 +582,10 @@ __kernel void neural_pow_mine(
             if (slot < MAX_RESULTS) {
                 found_scores[slot] = score;
 
+                // Vectorized nonce copy (NONCE_BYTES=16 = 2x uchar8)
                 __global uchar* nonce_out = found_nonces + slot * NONCE_BYTES;
-                for (int i = 0; i < NONCE_BYTES; i++) {
-                    nonce_out[i] = nonce[i];
-                }
+                vstore8(vload8(0, nonce), 0, nonce_out);
+                vstore8(vload8(0, nonce + 8), 0, nonce_out + 8);
             }
         }
     }
