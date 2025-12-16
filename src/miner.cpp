@@ -1,8 +1,5 @@
-// Neural Proof-of-Work - Host Code v2
-// FP32-heavy PoW with CPU verifier using identical quantization
-
-#pragma STDC FENV_ACCESS ON
-#pragma STDC FP_CONTRACT OFF
+// Neural Proof-of-Work Miner - OpenCL Only
+// All crypto/neural ops done on GPU - no CPU implementations
 
 #ifdef __APPLE__
 #include <OpenCL/opencl.h>
@@ -10,18 +7,15 @@
 #include <CL/cl.h>
 #endif
 
-#include <algorithm>
 #include <atomic>
-#include <cfenv>
 #include <chrono>
-#include <cmath>
 #include <csignal>
-#include <cstdlib>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <iomanip>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <random>
 #include <sstream>
@@ -36,436 +30,10 @@
 #include "kernel_embedded.h"
 #include "config.h"
 
-// ============================================================================
-// Configuration
-// ============================================================================
-
 #define STRINGIFY_(x) #x
 #define STRINGIFY(x) STRINGIFY_(x)
 
-
-// ============================================================================
-// CPU Verifier - MUST match GPU exactly
-// ============================================================================
-
-namespace cpu_verifier {
-
-// Weight/input scaling factors
-constexpr float WEIGHT_SCALE = 1.0f / 127.0f;   // int8 weights in [-127, 127]
-constexpr float INPUT_SCALE = 1.0f / 32768.0f;  // int16 inputs in [-32768, 32767]
-
-// Q16 fixed-point constants (16 fractional bits)
-constexpr float Q16_SCALE = 65536.0f;           // 2^16
-constexpr float Q16_INV_SCALE = 1.0f / 65536.0f;
-constexpr float Q16_MIN = -32768.0f;            // Min value before overflow when scaled
-constexpr float Q16_MAX = 32767.0f;             // Max value before overflow when scaled
-
-// Quantization using round-to-nearest-even (matches OpenCL convert_int_rte)
-// Use lrintf (float version) to match OpenCL's convert_int_rte(float) exactly
-inline float q16(float x) {
-    if (!std::isfinite(x)) x = 0.0f;
-    x = std::max(Q16_MIN, std::min(Q16_MAX, x));
-    int32_t i = static_cast<int32_t>(std::lrintf(x * Q16_SCALE));
-    return static_cast<float>(i) * Q16_INV_SCALE;
-}
-
-// Get q16 as integer representation (for deterministic scoring)
-inline int32_t q16_to_int(float q16_val) {
-    return static_cast<int32_t>(std::lrintf(q16_val * Q16_SCALE));
-}
-
-inline float get_weight(const int8_t* weights, size_t idx) {
-    return static_cast<float>(weights[idx]) * WEIGHT_SCALE;
-}
-
-// Forward declaration - expand_nonce is implemented after sha256 namespace
-void expand_nonce(const uint8_t* nonce, size_t nonce_len, uint8_t* expanded);
-
-// Convert 64 expanded bytes to INPUT_DIM floats
-void expanded_to_input(const uint8_t* expanded, float* input) {
-    for (int i = 0; i < INPUT_DIM; i++) {
-        int16_t val = static_cast<int16_t>(expanded[i*2] | (expanded[i*2 + 1] << 8));
-        input[i] = q16(static_cast<float>(val) * INPUT_SCALE);
-    }
-}
-
-// Full nonce-to-input: any nonce -> SHA256 expand -> 32 floats
-void nonce_to_input(const uint8_t* nonce, size_t nonce_len, float* input) {
-    uint8_t expanded[64];
-    expand_nonce(nonce, nonce_len, expanded);
-    expanded_to_input(expanded, input);
-}
-
-float matmul_row(const int8_t* W, const int8_t* bias, const float* input, size_t in_dim) {
-    float sum = 0.0f;
-
-    for (size_t i = 0; i < in_dim; i++) {
-        float prod = get_weight(W, i) * input[i];
-        sum = sum + prod;
-
-        if ((i & 31) == 31) {
-            sum = q16(sum);
-        }
-    }
-
-    sum += static_cast<float>(*bias) * WEIGHT_SCALE;
-    return q16(sum);
-}
-
-// Note: matmul_row returns q16, and ReLU(q16) stays on grid (0.0f or unchanged)
-void layer_forward(
-    const int8_t* W,
-    const int8_t* bias,
-    const float* input,
-    float* output,
-    size_t in_dim,
-    size_t out_dim,
-    bool use_relu
-) {
-    for (size_t i = 0; i < out_dim; i++) {
-        float sum = matmul_row(W + i * in_dim, bias + i, input, in_dim);
-        output[i] = use_relu ? std::max(0.0f, sum) : sum;
-    }
-}
-
-// ============================================================================
-// SipHash-2-4 - Proper cryptographic mixing for digest
-// ============================================================================
-
-inline uint64_t rotl64(uint64_t x, int b) {
-    return (x << b) | (x >> (64 - b));
-}
-
-inline void sipround(uint64_t& v0, uint64_t& v1, uint64_t& v2, uint64_t& v3) {
-    v0 += v1; v1 = rotl64(v1, 13); v1 ^= v0; v0 = rotl64(v0, 32);
-    v2 += v3; v3 = rotl64(v3, 16); v3 ^= v2;
-    v0 += v3; v3 = rotl64(v3, 21); v3 ^= v0;
-    v2 += v1; v1 = rotl64(v1, 17); v1 ^= v2; v2 = rotl64(v2, 32);
-}
-
-// SipHash-2-4 specialized for SIPHASH_INPUT_BYTES (132 bytes)
-// Matches kernel's siphash_2_4_132 exactly to avoid divergence
-uint64_t siphash_2_4_132(const uint8_t* data, uint64_t k0, uint64_t k1) {
-    uint64_t v0 = k0 ^ 0x736f6d6570736575ULL;
-    uint64_t v1 = k1 ^ 0x646f72616e646f6dULL;
-    uint64_t v2 = k0 ^ 0x6c7967656e657261ULL;
-    uint64_t v3 = k1 ^ 0x7465646279746573ULL;
-
-    // Process 16 full 8-byte blocks (128 bytes)
-    for (int blk = 0; blk < 16; blk++) {
-        const uint8_t* p = data + blk * 8;
-        uint64_t m = static_cast<uint64_t>(p[0])
-                   | (static_cast<uint64_t>(p[1]) << 8)
-                   | (static_cast<uint64_t>(p[2]) << 16)
-                   | (static_cast<uint64_t>(p[3]) << 24)
-                   | (static_cast<uint64_t>(p[4]) << 32)
-                   | (static_cast<uint64_t>(p[5]) << 40)
-                   | (static_cast<uint64_t>(p[6]) << 48)
-                   | (static_cast<uint64_t>(p[7]) << 56);
-        v3 ^= m;
-        sipround(v0, v1, v2, v3);
-        sipround(v0, v1, v2, v3);
-        v0 ^= m;
-    }
-
-    // Process final 4 bytes + length (132 = 0x84)
-    const uint8_t* p = data + 128;
-    uint64_t b = (132ULL << 56)
-               | static_cast<uint64_t>(p[0])
-               | (static_cast<uint64_t>(p[1]) << 8)
-               | (static_cast<uint64_t>(p[2]) << 16)
-               | (static_cast<uint64_t>(p[3]) << 24);
-
-    v3 ^= b;
-    sipround(v0, v1, v2, v3);
-    sipround(v0, v1, v2, v3);
-    v0 ^= b;
-
-    // Finalization
-    v2 ^= 0xff;
-    sipround(v0, v1, v2, v3);
-    sipround(v0, v1, v2, v3);
-    sipround(v0, v1, v2, v3);
-    sipround(v0, v1, v2, v3);
-
-    return v0 ^ v1 ^ v2 ^ v3;
-}
-
-// SipHash keys defined in config.h
-
-void compute_digest(const float* output, uint8_t* digest, size_t dim) {
-    // Serialize q16 integers directly into SipHash input buffer
-    uint8_t input[SIPHASH_INPUT_BYTES];
-    for (size_t i = 0; i < dim; i++) {
-        int32_t val = q16_to_int(output[i]);
-        input[i * 4 + 0] = static_cast<uint8_t>(val & 0xFF);
-        input[i * 4 + 1] = static_cast<uint8_t>((val >> 8) & 0xFF);
-        input[i * 4 + 2] = static_cast<uint8_t>((val >> 16) & 0xFF);
-        input[i * 4 + 3] = static_cast<uint8_t>((val >> 24) & 0xFF);
-    }
-    // Zero-pad domain separator (only first byte changes per block)
-    input[SERIALIZED_OUTPUT_BYTES + 1] = 0;
-    input[SERIALIZED_OUTPUT_BYTES + 2] = 0;
-    input[SERIALIZED_OUTPUT_BYTES + 3] = 0;
-
-    // Generate DIGEST_BYTES of digest using SipHash with domain separation
-    for (size_t block = 0; block < (DIGEST_BYTES / 8); block++) {
-        input[SERIALIZED_OUTPUT_BYTES] = static_cast<uint8_t>(block);
-        uint64_t h = siphash_2_4_132(input, SIPHASH_K0, SIPHASH_K1);
-
-        // Extract 8 bytes from hash (little-endian)
-        for (int i = 0; i < 8; i++) {
-            digest[block * 8 + i] = static_cast<uint8_t>((h >> (i * 8)) & 0xFF);
-        }
-    }
-}
-
-int count_leading_zero_bits(const uint8_t* digest, size_t len) {
-    int bits = 0;
-    for (size_t i = 0; i < len; i++) {
-        uint8_t b = digest[i];
-        if (b == 0) {
-            bits += 8;
-            continue;
-        }
-        int lz = 0;
-        while ((b & 0x80u) == 0) {
-            lz++;
-            b <<= 1;
-        }
-        bits += lz;
-        break;
-    }
-    return bits;
-}
-
-// Score = first 8 bytes of digest as big-endian uint64 (lower = better)
-uint64_t compute_score(const float* output, size_t dim) {
-    uint8_t digest[DIGEST_BYTES];
-    compute_digest(output, digest, dim);
-    return (static_cast<uint64_t>(digest[0]) << 56) | (static_cast<uint64_t>(digest[1]) << 48) |
-           (static_cast<uint64_t>(digest[2]) << 40) | (static_cast<uint64_t>(digest[3]) << 32) |
-           (static_cast<uint64_t>(digest[4]) << 24) | (static_cast<uint64_t>(digest[5]) << 16) |
-           (static_cast<uint64_t>(digest[6]) << 8)  | static_cast<uint64_t>(digest[7]);
-}
-
-// Convert score to leading zero bits (for display)
-int score_to_lz_bits(uint64_t score) {
-    if (score == 0) return 64;
-    int bits = 0;
-    while ((score & (1ULL << 63)) == 0) {
-        bits++;
-        score <<= 1;
-    }
-    return bits;
-}
-
-// Forward pass - computes network output from nonce (any length)
-void forward_pass(const int8_t* weights, const uint8_t* nonce, size_t nonce_len, float* output) {
-    float input[INPUT_DIM];
-    float hidden1[HIDDEN_DIM];
-    float hidden2[HIDDEN_DIM];
-    float hidden3[HIDDEN_DIM];
-
-    nonce_to_input(nonce, nonce_len, input);
-
-    layer_forward(weights + W1_OFFSET, weights + B1_OFFSET,
-                  input, hidden1, INPUT_DIM, HIDDEN_DIM, true);
-    layer_forward(weights + W2_OFFSET, weights + B2_OFFSET,
-                  hidden1, hidden2, HIDDEN_DIM, HIDDEN_DIM, true);
-    layer_forward(weights + W3_OFFSET, weights + B3_OFFSET,
-                  hidden2, hidden3, HIDDEN_DIM, HIDDEN_DIM, true);
-    layer_forward(weights + W4_OFFSET, weights + B4_OFFSET,
-                  hidden3, output, HIDDEN_DIM, OUTPUT_DIM, false);
-}
-
-// Full forward pass - returns score (lower = better)
-uint64_t forward(const int8_t* weights, const uint8_t* nonce, size_t nonce_len) {
-    float output[OUTPUT_DIM];
-    forward_pass(weights, nonce, nonce_len, output);
-    return compute_score(output, OUTPUT_DIM);
-}
-
-} // namespace cpu_verifier
-
-// ============================================================================
-// Weight Generation from Challenge String (SHA-256 based)
-// ============================================================================
-
-// Weights are derived from a global epoch identifier, not per-user.
-// This ensures all miners compute the same neural network, enabling fair difficulty comparison.
 constexpr const char* WEIGHT_EPOCH = "epoch0";
-
-namespace sha256 {
-
-static const uint32_t K[64] = {
-    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
-    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
-    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
-    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
-    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
-};
-
-#define ROTR(x, n) (((x) >> (n)) | ((x) << (32 - (n))))
-#define CH(x, y, z) (((x) & (y)) ^ (~(x) & (z)))
-#define MAJ(x, y, z) (((x) & (y)) ^ ((x) & (z)) ^ ((y) & (z)))
-#define EP0(x) (ROTR(x, 2) ^ ROTR(x, 13) ^ ROTR(x, 22))
-#define EP1(x) (ROTR(x, 6) ^ ROTR(x, 11) ^ ROTR(x, 25))
-#define SIG0(x) (ROTR(x, 7) ^ ROTR(x, 18) ^ ((x) >> 3))
-#define SIG1(x) (ROTR(x, 17) ^ ROTR(x, 19) ^ ((x) >> 10))
-
-void hash(const uint8_t* data, size_t len, uint8_t* out) {
-    // State array (FIPS 180-4 uses H(0)..H(7))
-    uint32_t H[8] = {
-        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
-        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
-    };
-
-    size_t padded_len = ((len + 9 + 63) / 64) * 64;
-    std::vector<uint8_t> padded(padded_len, 0);
-    memcpy(padded.data(), data, len);
-    padded[len] = 0x80;
-
-    uint64_t bits = len * 8;
-    for (int i = 0; i < 8; i++) {
-        padded[padded_len - 1 - i] = (bits >> (i * 8)) & 0xFF;
-    }
-
-    for (size_t block = 0; block < padded_len; block += 64) {
-        uint32_t w[64];
-
-        for (int i = 0; i < 16; i++) {
-            w[i] = (padded[block + i*4] << 24) |
-                   (padded[block + i*4 + 1] << 16) |
-                   (padded[block + i*4 + 2] << 8) |
-                   padded[block + i*4 + 3];
-        }
-
-        for (int i = 16; i < 64; i++) {
-            w[i] = SIG1(w[i-2]) + w[i-7] + SIG0(w[i-15]) + w[i-16];
-        }
-
-        // Working variables a-h (FIPS 180-4 standard names)
-        uint32_t a = H[0], b = H[1], c = H[2], d = H[3];
-        uint32_t e = H[4], f = H[5], g = H[6], h = H[7];
-
-        for (int i = 0; i < 64; i++) {
-            uint32_t t1 = h + EP1(e) + CH(e, f, g) + K[i] + w[i];
-            uint32_t t2 = EP0(a) + MAJ(a, b, c);
-            h = g; g = f; f = e; e = d + t1;
-            d = c; c = b; b = a; a = t1 + t2;
-        }
-
-        H[0] += a; H[1] += b; H[2] += c; H[3] += d;
-        H[4] += e; H[5] += f; H[6] += g; H[7] += h;
-    }
-
-    for (int i = 0; i < 8; i++) {
-        out[i*4] = (H[i] >> 24) & 0xFF;
-        out[i*4 + 1] = (H[i] >> 16) & 0xFF;
-        out[i*4 + 2] = (H[i] >> 8) & 0xFF;
-        out[i*4 + 3] = H[i] & 0xFF;
-    }
-}
-
-} // namespace sha256
-
-// Implementation of expand_nonce for cpu_verifier (uses sha256::hash from above)
-namespace cpu_verifier {
-void expand_nonce(const uint8_t* nonce, size_t nonce_len, uint8_t* expanded) {
-    std::vector<uint8_t> buf(nonce_len + 1);
-    std::memcpy(buf.data(), nonce, nonce_len);
-
-    // First half: SHA256(nonce || 0x00)
-    buf[nonce_len] = 0x00;
-    sha256::hash(buf.data(), buf.size(), expanded);
-
-    // Second half: SHA256(nonce || 0x01)
-    buf[nonce_len] = 0x01;
-    sha256::hash(buf.data(), buf.size(), expanded + 32);
-}
-} // namespace cpu_verifier
-
-void append_u32(std::vector<uint8_t>& data, uint32_t value) {
-    for (int i = 0; i < 4; i++) {
-        data.push_back(static_cast<uint8_t>((value >> (i * 8)) & 0xFF));
-    }
-}
-
-void generate_weights(const std::string& challenge, std::vector<int8_t>& weights) {
-    weights.resize(TOTAL_WEIGHTS);
-
-    uint8_t hash_out[32];
-    size_t weight_idx = 0;
-    uint32_t counter = 0;
-
-    while (weight_idx < TOTAL_WEIGHTS) {
-        std::vector<uint8_t> input(challenge.begin(), challenge.end());
-        append_u32(input, counter);
-
-        sha256::hash(input.data(), input.size(), hash_out);
-
-        for (size_t i = 0; i < 32 && weight_idx < TOTAL_WEIGHTS; i++) {
-            int8_t w = static_cast<int8_t>(hash_out[i]);
-            if (w == -128) w = -127;
-            weights[weight_idx++] = w;
-        }
-
-        counter++;
-    }
-}
-
-
-// ============================================================================
-// Shared State
-// ============================================================================
-
-struct SharedState {
-    std::mutex best_mutex;
-    uint64_t best_score;  // First 8 bytes of digest (lower = better)
-    std::vector<uint8_t> best_nonce;
-    std::vector<uint8_t> best_digest;
-    std::atomic<bool> running{true};
-    std::string username;
-    bool verbose = false;
-    std::vector<int8_t> weights;
-    std::chrono::steady_clock::time_point start_time;
-};
-
-// ============================================================================
-// GPU Context
-// ============================================================================
-
-// Double-buffered result structure for pipelined execution
-struct ResultBuffer {
-    cl_mem found_count_buf;
-    cl_mem found_scores_buf;
-    cl_mem found_nonces_buf;
-    cl_event kernel_done;
-    bool pending;  // Has a kernel been launched on this buffer?
-};
-
-struct GPUContext {
-    int device_index;
-    std::string device_name;
-    cl_device_id device;
-    cl_context context;
-    cl_command_queue queue;
-    cl_program program;
-    cl_kernel kernel;
-    cl_mem weights_buf;
-
-    // Double-buffered result buffers for pipelining
-    ResultBuffer buffers[2];
-    int current_buffer;
-
-    std::atomic<uint64_t> evals_computed{0};
-    std::atomic<uint64_t> matches_found{0};
-    std::atomic<uint64_t> launch_counter{0};
-};
 
 // ============================================================================
 // Utility Functions
@@ -480,69 +48,22 @@ std::string bytes_to_hex(const uint8_t* data, size_t len) {
     return ss.str();
 }
 
-std::string describe_lz_bits(int bits) {
-    return std::to_string(bits) + " bits";
+int count_leading_zero_bits(const uint8_t* digest, size_t len) {
+    int bits = 0;
+    for (size_t i = 0; i < len; i++) {
+        uint8_t b = digest[i];
+        if (b == 0) { bits += 8; continue; }
+        while ((b & 0x80u) == 0) { bits++; b <<= 1; }
+        break;
+    }
+    return bits;
 }
 
-// Base64 encoding table
-static const char BASE64_CHARS[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-std::string bytes_to_base64(const uint8_t* data, size_t len) {
-    std::string result;
-    result.reserve((len + 2) / 3 * 4);
-
-    for (size_t i = 0; i < len; i += 3) {
-        uint32_t n = static_cast<uint32_t>(data[i]) << 16;
-        if (i + 1 < len) n |= static_cast<uint32_t>(data[i + 1]) << 8;
-        if (i + 2 < len) n |= static_cast<uint32_t>(data[i + 2]);
-
-        result += BASE64_CHARS[(n >> 18) & 0x3F];
-        result += BASE64_CHARS[(n >> 12) & 0x3F];
-        result += (i + 1 < len) ? BASE64_CHARS[(n >> 6) & 0x3F] : '=';
-        result += (i + 2 < len) ? BASE64_CHARS[n & 0x3F] : '=';
-    }
-    return result;
-}
-
-bool base64_to_bytes(const std::string& b64, std::vector<uint8_t>& out) {
-    // Build reverse lookup table
-    static int8_t decode_table[256] = {-1};
-    static bool table_init = false;
-    if (!table_init) {
-        std::memset(decode_table, -1, sizeof(decode_table));
-        for (int i = 0; i < 64; i++) {
-            decode_table[static_cast<uint8_t>(BASE64_CHARS[i])] = static_cast<int8_t>(i);
-        }
-        table_init = true;
-    }
-
-    if (b64.size() % 4 != 0) return false;
-
-    size_t padding = 0;
-    if (!b64.empty() && b64[b64.size() - 1] == '=') padding++;
-    if (b64.size() > 1 && b64[b64.size() - 2] == '=') padding++;
-
-    out.resize((b64.size() / 4) * 3 - padding);
-
-    size_t j = 0;
-    for (size_t i = 0; i < b64.size(); i += 4) {
-        int8_t a = decode_table[static_cast<uint8_t>(b64[i])];
-        int8_t b = decode_table[static_cast<uint8_t>(b64[i + 1])];
-        int8_t c = (b64[i + 2] == '=') ? 0 : decode_table[static_cast<uint8_t>(b64[i + 2])];
-        int8_t d = (b64[i + 3] == '=') ? 0 : decode_table[static_cast<uint8_t>(b64[i + 3])];
-
-        if (a < 0 || b < 0 || (b64[i + 2] != '=' && c < 0) || (b64[i + 3] != '=' && d < 0)) {
-            return false;
-        }
-
-        uint32_t n = (static_cast<uint32_t>(a) << 18) | (static_cast<uint32_t>(b) << 12) |
-                     (static_cast<uint32_t>(c) << 6) | static_cast<uint32_t>(d);
-
-        if (j < out.size()) out[j++] = static_cast<uint8_t>((n >> 16) & 0xFF);
-        if (j < out.size()) out[j++] = static_cast<uint8_t>((n >> 8) & 0xFF);
-        if (j < out.size()) out[j++] = static_cast<uint8_t>(n & 0xFF);
-    }
-    return true;
+int score_to_lz_bits(uint64_t score) {
+    if (score == 0) return 64;
+    int bits = 0;
+    while ((score & (1ULL << 63)) == 0) { bits++; score <<= 1; }
+    return bits;
 }
 
 std::string format_digest_with_marker(const std::string& hex, int lz_bits) {
@@ -553,20 +74,63 @@ std::string format_digest_with_marker(const std::string& hex, int lz_bits) {
 }
 
 // ============================================================================
-// GPU Discovery
+// Shared State
+// ============================================================================
+
+struct SharedState {
+    std::mutex best_mutex;
+    uint64_t best_score;
+    std::vector<uint8_t> best_nonce;
+    std::vector<uint8_t> best_digest;
+    std::atomic<bool> running{true};
+    std::string username;
+    bool verbose = false;
+    std::chrono::steady_clock::time_point start_time;
+};
+
+// ============================================================================
+// GPU Context
+// ============================================================================
+
+struct ResultBuffer {
+    cl_mem found_count_buf;
+    cl_mem found_scores_buf;
+    cl_mem found_nonces_buf;
+    cl_event kernel_done;
+    bool pending;
+};
+
+struct GPUContext {
+    int device_index;
+    std::string device_name;
+    cl_device_id device;
+    cl_context context;
+    cl_command_queue queue;
+    cl_program program;
+    cl_kernel mine_kernel;
+    cl_kernel verify_kernel;
+    cl_mem weights_buf;
+
+    ResultBuffer buffers[2];
+    int current_buffer;
+
+    std::atomic<uint64_t> evals_computed{0};
+    std::atomic<uint64_t> matches_found{0};
+    std::atomic<uint64_t> launch_counter{0};
+};
+
+// ============================================================================
+// OpenCL Helpers
 // ============================================================================
 
 std::vector<cl_device_id> discover_all_gpus() {
     std::vector<cl_device_id> all_devices;
-
     cl_uint num_platforms;
     if (clGetPlatformIDs(0, nullptr, &num_platforms) != CL_SUCCESS || num_platforms == 0) {
         return all_devices;
     }
-
     std::vector<cl_platform_id> platforms(num_platforms);
     clGetPlatformIDs(num_platforms, platforms.data(), nullptr);
-
     for (cl_platform_id platform : platforms) {
         cl_uint num_devices;
         if (clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, 0, nullptr, &num_devices) == CL_SUCCESS && num_devices > 0) {
@@ -575,15 +139,111 @@ std::vector<cl_device_id> discover_all_gpus() {
             all_devices.insert(all_devices.end(), devices.begin(), devices.end());
         }
     }
-
     return all_devices;
 }
 
-// ============================================================================
-// GPU Context Creation
-// ============================================================================
+// Generate weights on GPU using generate_weights_kernel
+bool generate_weights_gpu(GPUContext& ctx, const std::string& epoch, std::vector<int8_t>& weights) {
+    cl_int err;
 
-bool create_gpu_context(cl_device_id device, int device_index, const SharedState& shared, GPUContext& ctx) {
+    // Create generate_weights kernel
+    cl_kernel gen_kernel = clCreateKernel(ctx.program, "generate_weights_kernel", &err);
+    if (err != CL_SUCCESS) {
+        std::cerr << "Failed to create generate_weights_kernel: " << err << std::endl;
+        return false;
+    }
+
+    // Create buffers
+    cl_mem epoch_buf = clCreateBuffer(ctx.context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                       epoch.size(), (void*)epoch.data(), &err);
+    cl_mem weights_buf = clCreateBuffer(ctx.context, CL_MEM_WRITE_ONLY, TOTAL_WEIGHTS, nullptr, &err);
+    if (err != CL_SUCCESS) {
+        std::cerr << "Failed to create buffers for weight generation" << std::endl;
+        clReleaseKernel(gen_kernel);
+        return false;
+    }
+
+    // Set args
+    cl_uint epoch_len = static_cast<cl_uint>(epoch.size());
+    clSetKernelArg(gen_kernel, 0, sizeof(cl_mem), &epoch_buf);
+    clSetKernelArg(gen_kernel, 1, sizeof(cl_uint), &epoch_len);
+    clSetKernelArg(gen_kernel, 2, sizeof(cl_mem), &weights_buf);
+
+    // Launch - one work-item per 32 bytes
+    size_t global_size = (TOTAL_WEIGHTS + 31) / 32;
+    err = clEnqueueNDRangeKernel(ctx.queue, gen_kernel, 1, nullptr, &global_size, nullptr, 0, nullptr, nullptr);
+    if (err != CL_SUCCESS) {
+        std::cerr << "Failed to launch generate_weights_kernel: " << err << std::endl;
+        clReleaseMemObject(epoch_buf);
+        clReleaseMemObject(weights_buf);
+        clReleaseKernel(gen_kernel);
+        return false;
+    }
+
+    // Read back weights
+    weights.resize(TOTAL_WEIGHTS);
+    err = clEnqueueReadBuffer(ctx.queue, weights_buf, CL_TRUE, 0, TOTAL_WEIGHTS, weights.data(), 0, nullptr, nullptr);
+
+    clReleaseMemObject(epoch_buf);
+    clReleaseMemObject(weights_buf);
+    clReleaseKernel(gen_kernel);
+
+    return err == CL_SUCCESS;
+}
+
+// Verify a nonce on GPU, returns (score, digest, bits)
+struct VerifyResult {
+    uint64_t score;
+    std::vector<uint8_t> digest;
+    int bits;
+};
+
+bool verify_nonce_gpu(GPUContext& ctx, const std::vector<uint8_t>& nonce, VerifyResult& result) {
+    cl_int err;
+
+    // Create buffers
+    cl_mem nonce_buf = clCreateBuffer(ctx.context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                       nonce.size(), (void*)nonce.data(), &err);
+    cl_mem score_buf = clCreateBuffer(ctx.context, CL_MEM_WRITE_ONLY, sizeof(cl_ulong), nullptr, &err);
+    cl_mem digest_buf = clCreateBuffer(ctx.context, CL_MEM_WRITE_ONLY, DIGEST_BYTES, nullptr, &err);
+    if (err != CL_SUCCESS) {
+        std::cerr << "Failed to create verify buffers" << std::endl;
+        return false;
+    }
+
+    // Set args
+    cl_uint nonce_len = static_cast<cl_uint>(nonce.size());
+    clSetKernelArg(ctx.verify_kernel, 0, sizeof(cl_mem), &ctx.weights_buf);
+    clSetKernelArg(ctx.verify_kernel, 1, sizeof(cl_mem), &nonce_buf);
+    clSetKernelArg(ctx.verify_kernel, 2, sizeof(cl_uint), &nonce_len);
+    clSetKernelArg(ctx.verify_kernel, 3, sizeof(cl_mem), &score_buf);
+    clSetKernelArg(ctx.verify_kernel, 4, sizeof(cl_mem), &digest_buf);
+
+    // Launch single work-item
+    size_t global_size = 1;
+    err = clEnqueueNDRangeKernel(ctx.queue, ctx.verify_kernel, 1, nullptr, &global_size, nullptr, 0, nullptr, nullptr);
+    if (err != CL_SUCCESS) {
+        std::cerr << "Failed to launch verify kernel: " << err << std::endl;
+        clReleaseMemObject(nonce_buf);
+        clReleaseMemObject(score_buf);
+        clReleaseMemObject(digest_buf);
+        return false;
+    }
+
+    // Read results
+    result.digest.resize(DIGEST_BYTES);
+    clEnqueueReadBuffer(ctx.queue, score_buf, CL_TRUE, 0, sizeof(cl_ulong), &result.score, 0, nullptr, nullptr);
+    clEnqueueReadBuffer(ctx.queue, digest_buf, CL_TRUE, 0, DIGEST_BYTES, result.digest.data(), 0, nullptr, nullptr);
+    result.bits = count_leading_zero_bits(result.digest.data(), DIGEST_BYTES);
+
+    clReleaseMemObject(nonce_buf);
+    clReleaseMemObject(score_buf);
+    clReleaseMemObject(digest_buf);
+
+    return true;
+}
+
+bool create_gpu_context(cl_device_id device, int device_index, GPUContext& ctx) {
     ctx.device_index = device_index;
     ctx.device = device;
 
@@ -628,52 +288,43 @@ bool create_gpu_context(cl_device_id device, int device_index, const SharedState
         return false;
     }
 
-    ctx.kernel = clCreateKernel(ctx.program, "neural_pow_mine", &err);
+    ctx.mine_kernel = clCreateKernel(ctx.program, "neural_pow_mine", &err);
     if (err != CL_SUCCESS) {
-        std::cerr << "[GPU " << device_index << "] Failed to create kernel: " << err << std::endl;
+        std::cerr << "[GPU " << device_index << "] Failed to create mine kernel: " << err << std::endl;
         return false;
     }
 
-    // Create buffers
-    ctx.weights_buf = clCreateBuffer(ctx.context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-                                      shared.weights.size(), (void*)shared.weights.data(), &err);
+    ctx.verify_kernel = clCreateKernel(ctx.program, "neural_pow_verify", &err);
     if (err != CL_SUCCESS) {
-        std::cerr << "[GPU " << device_index << "] Failed to create weights buffer: " << err << std::endl;
+        std::cerr << "[GPU " << device_index << "] Failed to create verify kernel: " << err << std::endl;
         return false;
     }
 
-    // Create double-buffered result buffers for pipelining
+    // Double-buffered result buffers
     for (int i = 0; i < 2; i++) {
         ctx.buffers[i].found_count_buf = clCreateBuffer(ctx.context, CL_MEM_READ_WRITE, sizeof(cl_uint), nullptr, &err);
         ctx.buffers[i].found_scores_buf = clCreateBuffer(ctx.context, CL_MEM_WRITE_ONLY, MAX_RESULTS * sizeof(cl_ulong), nullptr, &err);
         ctx.buffers[i].found_nonces_buf = clCreateBuffer(ctx.context, CL_MEM_WRITE_ONLY, MAX_RESULTS * NONCE_BYTES, nullptr, &err);
         ctx.buffers[i].kernel_done = nullptr;
         ctx.buffers[i].pending = false;
-
-        if (err != CL_SUCCESS) {
-            std::cerr << "[GPU " << device_index << "] Failed to create result buffers: " << err << std::endl;
-            return false;
-        }
     }
     ctx.current_buffer = 0;
 
-    // Set static kernel args (buffer args set per launch)
-    clSetKernelArg(ctx.kernel, 0, sizeof(cl_mem), &ctx.weights_buf);
-    // arg 1 (target_score) set per launch
-    // arg 2 (seed_lo) set per launch
-    // arg 3 (seed_hi) set per launch
-    // args 4-6 (result buffers) set per launch for double-buffering
-
     return true;
+}
+
+void setup_weights_buffer(GPUContext& ctx, const std::vector<int8_t>& weights) {
+    cl_int err;
+    ctx.weights_buf = clCreateBuffer(ctx.context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                      weights.size(), (void*)weights.data(), &err);
+    clSetKernelArg(ctx.mine_kernel, 0, sizeof(cl_mem), &ctx.weights_buf);
 }
 
 // ============================================================================
 // GPU Worker Thread
 // ============================================================================
 
-// Process results from a completed kernel
 void process_kernel_results(GPUContext& ctx, SharedState& shared, ResultBuffer& buf) {
-    // Count evals at completion time for accurate rate measurement
     ctx.evals_computed.fetch_add(static_cast<uint64_t>(GLOBAL_SIZE) * HASHES_PER_THREAD);
 
     cl_uint found_count;
@@ -690,60 +341,39 @@ void process_kernel_results(GPUContext& ctx, SharedState& shared, ResultBuffer& 
         clEnqueueReadBuffer(ctx.queue, buf.found_nonces_buf, CL_TRUE, 0,
                            results_to_read * NONCE_BYTES, all_nonces.data(), 0, nullptr, nullptr);
 
-        // Find best in batch (lowest score = best)
+        // Find best in batch
         size_t best_idx = 0;
         for (size_t i = 1; i < results_to_read; i++) {
-            if (all_scores[i] < all_scores[best_idx]) {
-                best_idx = i;
-            }
+            if (all_scores[i] < all_scores[best_idx]) best_idx = i;
         }
 
         uint64_t batch_best_score = all_scores[best_idx];
         uint8_t* batch_best_nonce = all_nonces.data() + best_idx * NONCE_BYTES;
 
-        // Verify on CPU - must match bit-exactly (consensus requirement)
-        uint64_t cpu_score = cpu_verifier::forward(shared.weights.data(), batch_best_nonce, NONCE_BYTES);
-
-        // Scores must match exactly - any difference is a determinism bug
-        if (cpu_score != batch_best_score) {
-            std::cerr << "[GPU " << ctx.device_index << "] CRITICAL: Score mismatch! "
-                      << "GPU=0x" << std::hex << batch_best_score
-                      << " CPU=0x" << cpu_score << std::dec << std::endl;
-            return;  // Reject mismatched results
-        }
-
+        // Trust GPU score directly - no CPU verification
         {
             std::lock_guard<std::mutex> lock(shared.best_mutex);
-            if (cpu_score < shared.best_score) {
-                float outputs[OUTPUT_DIM];
-                cpu_verifier::forward_pass(shared.weights.data(), batch_best_nonce, NONCE_BYTES, outputs);
-                uint8_t digest[DIGEST_BYTES];
-                cpu_verifier::compute_digest(outputs, digest, OUTPUT_DIM);
-                int lz_bits = cpu_verifier::count_leading_zero_bits(digest, DIGEST_BYTES);
-                std::string digest_hex = bytes_to_hex(digest, DIGEST_BYTES);
+            if (batch_best_score < shared.best_score) {
+                // Verify on GPU to get digest for display
+                VerifyResult vr;
+                std::vector<uint8_t> nonce_vec(batch_best_nonce, batch_best_nonce + NONCE_BYTES);
+                verify_nonce_gpu(ctx, nonce_vec, vr);
+
+                std::string digest_hex = bytes_to_hex(vr.digest.data(), DIGEST_BYTES);
                 std::string nonce_str(reinterpret_cast<char*>(batch_best_nonce), NONCE_BYTES);
 
-                shared.best_score = cpu_score;
+                shared.best_score = batch_best_score;
                 shared.best_nonce.assign(batch_best_nonce, batch_best_nonce + NONCE_BYTES);
-                shared.best_digest.assign(digest, digest + DIGEST_BYTES);
+                shared.best_digest = vr.digest;
                 ctx.matches_found.fetch_add(1);
 
                 auto now = std::chrono::steady_clock::now();
                 auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - shared.start_time).count();
 
                 std::cout << "\n[GPU " << ctx.device_index << "] NEW BEST: "
-                          << describe_lz_bits(lz_bits) << " | digest="
-                          << format_digest_with_marker(digest_hex, lz_bits) << std::endl;
+                          << vr.bits << " bits | digest="
+                          << format_digest_with_marker(digest_hex, vr.bits) << std::endl;
                 std::cout << "  Proof: " << shared.username << "/" << nonce_str << std::endl;
-                if (shared.verbose) {
-                    std::cout << "  Output: [";
-                    for (size_t j = 0; j < OUTPUT_DIM; j++) {
-                        std::cout << std::fixed << std::setprecision(3)
-                                  << std::setw(7) << outputs[j];
-                        if (j < OUTPUT_DIM - 1) std::cout << ", ";
-                    }
-                    std::cout << "]" << std::endl;
-                }
                 std::cout << "  Time: " << elapsed << "s | Batch had " << found_count << " candidates" << std::endl;
                 std::cout << std::endl;
             }
@@ -754,7 +384,6 @@ void process_kernel_results(GPUContext& ctx, SharedState& shared, ResultBuffer& 
 void gpu_worker_thread(GPUContext& ctx, SharedState& shared) {
     std::cout << "[GPU " << ctx.device_index << "] Started mining on " << ctx.device_name << std::endl;
 
-    // Thread-local RNG for generating kernel seeds
     std::random_device rd;
     std::mt19937 rng(rd());
 
@@ -762,24 +391,18 @@ void gpu_worker_thread(GPUContext& ctx, SharedState& shared) {
     size_t local_size = LOCAL_SIZE;
 
     while (shared.running.load()) {
-        // Get current buffer
         ResultBuffer& buf = ctx.buffers[ctx.current_buffer];
 
-        // If there's a pending kernel on this buffer, wait for it and process results
         if (buf.pending) {
             clWaitForEvents(1, &buf.kernel_done);
             clReleaseEvent(buf.kernel_done);
             buf.kernel_done = nullptr;
             buf.pending = false;
-
-            // Process results while next kernel could be running
             process_kernel_results(ctx, shared, buf);
         }
 
-        // Check if we should stop
         if (!shared.running.load()) break;
 
-        // Get current target
         cl_ulong target_score;
         {
             std::lock_guard<std::mutex> lock(shared.best_mutex);
@@ -790,33 +413,26 @@ void gpu_worker_thread(GPUContext& ctx, SharedState& shared) {
         cl_uint seed_lo = rng();
         cl_uint seed_hi = rng();
 
-        // Reset found count
         cl_uint zero = 0;
         clEnqueueWriteBuffer(ctx.queue, buf.found_count_buf, CL_FALSE, 0, sizeof(cl_uint), &zero, 0, nullptr, nullptr);
 
-        // Set kernel args including buffer-specific args
-        clSetKernelArg(ctx.kernel, 1, sizeof(cl_ulong), &target_score);
-        clSetKernelArg(ctx.kernel, 2, sizeof(cl_uint), &seed_lo);
-        clSetKernelArg(ctx.kernel, 3, sizeof(cl_uint), &seed_hi);
-        clSetKernelArg(ctx.kernel, 4, sizeof(cl_mem), &buf.found_count_buf);
-        clSetKernelArg(ctx.kernel, 5, sizeof(cl_mem), &buf.found_scores_buf);
-        clSetKernelArg(ctx.kernel, 6, sizeof(cl_mem), &buf.found_nonces_buf);
+        clSetKernelArg(ctx.mine_kernel, 1, sizeof(cl_ulong), &target_score);
+        clSetKernelArg(ctx.mine_kernel, 2, sizeof(cl_uint), &seed_lo);
+        clSetKernelArg(ctx.mine_kernel, 3, sizeof(cl_uint), &seed_hi);
+        clSetKernelArg(ctx.mine_kernel, 4, sizeof(cl_mem), &buf.found_count_buf);
+        clSetKernelArg(ctx.mine_kernel, 5, sizeof(cl_mem), &buf.found_scores_buf);
+        clSetKernelArg(ctx.mine_kernel, 6, sizeof(cl_mem), &buf.found_nonces_buf);
 
-        // Launch kernel with event for completion tracking
-        cl_int err = clEnqueueNDRangeKernel(ctx.queue, ctx.kernel, 1, nullptr, &global_size, &local_size, 0, nullptr, &buf.kernel_done);
+        cl_int err = clEnqueueNDRangeKernel(ctx.queue, ctx.mine_kernel, 1, nullptr, &global_size, &local_size, 0, nullptr, &buf.kernel_done);
         if (err != CL_SUCCESS) {
             std::cerr << "[GPU " << ctx.device_index << "] Kernel error: " << err << std::endl;
             break;
         }
 
         buf.pending = true;
-        // Note: evals_computed is incremented in process_kernel_results after completion
-
-        // Swap to other buffer for next iteration
         ctx.current_buffer = 1 - ctx.current_buffer;
     }
 
-    // Clean up any pending kernels
     for (int i = 0; i < 2; i++) {
         if (ctx.buffers[i].pending && ctx.buffers[i].kernel_done) {
             clWaitForEvents(1, &ctx.buffers[i].kernel_done);
@@ -838,173 +454,72 @@ void signal_handler(int) {
 }
 
 // ============================================================================
-// FP Environment Setup
-// ============================================================================
-
-void setup_fp_environment() {
-    // Set rounding mode to round-to-nearest-even (matches OpenCL convert_int_rte)
-    std::fesetround(FE_TONEAREST);
-}
-
-// ============================================================================
-// Golden Vector Test - Verify GPU/CPU determinism at startup
-// ============================================================================
-
-bool run_determinism_test(const SharedState& shared) {
-    // Generate a test nonce deterministically from the username
-    uint8_t test_nonce[NONCE_BYTES];
-    uint8_t hash_out[32];
-    std::string test_material = shared.username + ":test_nonce";
-    sha256::hash(reinterpret_cast<const uint8_t*>(test_material.data()),
-                 test_material.size(), hash_out);
-    // Fill nonce from hash (repeat if needed)
-    for (size_t i = 0; i < NONCE_BYTES; i++) {
-        test_nonce[i] = hash_out[i % 32];
-    }
-
-    // CPU computation
-    uint64_t cpu_score = cpu_verifier::forward(shared.weights.data(), test_nonce, NONCE_BYTES);
-    float cpu_outputs[OUTPUT_DIM];
-    cpu_verifier::forward_pass(shared.weights.data(), test_nonce, NONCE_BYTES, cpu_outputs);
-    uint8_t digest[DIGEST_BYTES];
-    cpu_verifier::compute_digest(cpu_outputs, digest, OUTPUT_DIM);
-    int cpu_bits = cpu_verifier::count_leading_zero_bits(digest, DIGEST_BYTES);
-
-    // Self-consistency check: run CPU twice, must match
-    uint64_t cpu_score2 = cpu_verifier::forward(shared.weights.data(), test_nonce, NONCE_BYTES);
-    if (cpu_score != cpu_score2) {
-        std::cerr << "FATAL: CPU verifier is not deterministic!" << std::endl;
-        std::cerr << "  Run 1: 0x" << std::hex << cpu_score << std::endl;
-        std::cerr << "  Run 2: 0x" << cpu_score2 << std::dec << std::endl;
-        return false;
-    }
-
-    // Verify lrintf uses round-to-nearest-even (banker's rounding)
-    // This is critical for CPU/GPU determinism since OpenCL's convert_int_rte uses this mode
-    // Halfway values (x.5) round to the nearest even integer:
-    //   0.5 -> 0 (even), 1.5 -> 2 (even), 2.5 -> 2 (even)
-    //   -0.5 -> 0 (even), -1.5 -> -2 (even), -2.5 -> -2 (even)
-    // Non-halfway values round normally: 0.4999 -> 0, 0.5001 -> 1
-    float test_vals[] = {0.5f, 1.5f, 2.5f, -0.5f, -1.5f, -2.5f, 0.4999f, 0.5001f};
-    int32_t expected[] = {0, 2, 2, 0, -2, -2, 0, 1};
-
-    for (size_t i = 0; i < sizeof(test_vals) / sizeof(test_vals[0]); i++) {
-        int32_t result = static_cast<int32_t>(std::lrintf(test_vals[i]));
-        if (result != expected[i]) {
-            std::cerr << "WARNING: lrintf(" << test_vals[i] << ") = " << result
-                      << ", expected " << expected[i] << std::endl;
-            std::cerr << "  This may cause CPU/GPU mismatches on this platform" << std::endl;
-        }
-    }
-
-    std::string digest_hex = bytes_to_hex(digest, DIGEST_BYTES);
-    std::cout << "[Test] CPU determinism check PASSED" << std::endl;
-    std::cout << "[Test] Test nonce digest: " << format_digest_with_marker(digest_hex, cpu_bits)
-              << " (" << cpu_bits << " LZ bits)" << std::endl;
-
-    return true;
-}
-
-// ============================================================================
 // Main
 // ============================================================================
 
 int main(int argc, char* argv[]) {
-    // Setup FP environment (rounding mode, FTZ/DAZ)
-    setup_fp_environment();
-
     std::string username = DEFAULT_USERNAME;
     std::string verify_proof;
     int target_zero_bits = 16;
     bool verbose = false;
 
-    // Option prefix lengths (compile-time)
-    constexpr size_t USER_PREFIX_LEN = sizeof("--user=") - 1;
-    constexpr size_t BITS_PREFIX_LEN = sizeof("--bits=") - 1;
-    constexpr size_t HEX_PREFIX_LEN = sizeof("--hex=") - 1;
-    constexpr size_t VERIFY_PREFIX_LEN = sizeof("--verify=") - 1;
-
-    auto parse_bits_value = [&](const std::string& value, int multiplier) {
-        try {
-            int val = std::stoi(value);
-            target_zero_bits = std::max(val * multiplier, 1);
-        } catch (const std::exception&) {
-            std::cerr << "Invalid numeric target: " << value << std::endl;
-            std::exit(1);
-        }
-    };
-
-    std::vector<std::string> positional;
+    // Parse arguments
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
 
-        // Helper to get required next argument
-        auto require_next_arg = [&]() -> std::string {
-            if (i + 1 >= argc) {
-                std::cerr << "Flag " << arg << " requires a value" << std::endl;
-                std::exit(1);
-            }
-            return std::string(argv[++i]);
-        };
-
-        if (arg == "--user" || arg == "-u") {
-            username = require_next_arg();
-            continue;
-        }
-        if (arg.rfind("--user=", 0) == 0) {
-            username = arg.substr(USER_PREFIX_LEN);
-            continue;
-        }
-
-        if (arg == "--bits" || arg == "-b") {
-            parse_bits_value(require_next_arg(), 1);
-            continue;
-        }
-        if (arg == "--hex" || arg == "-x") {
-            parse_bits_value(require_next_arg(), 4);
-            continue;
-        }
-        if (arg.rfind("--bits=", 0) == 0) {
-            parse_bits_value(arg.substr(BITS_PREFIX_LEN), 1);
-            continue;
-        }
-        if (arg.rfind("--hex=", 0) == 0) {
-            parse_bits_value(arg.substr(HEX_PREFIX_LEN), 4);
-            continue;
-        }
-
-        if (arg == "--verbose" || arg == "-v") {
+        if ((arg == "--user" || arg == "-u") && i + 1 < argc) {
+            username = argv[++i];
+        } else if (arg.rfind("--user=", 0) == 0) {
+            username = arg.substr(7);
+        } else if ((arg == "--bits" || arg == "-b") && i + 1 < argc) {
+            target_zero_bits = std::max(std::stoi(argv[++i]), 1);
+        } else if (arg.rfind("--bits=", 0) == 0) {
+            target_zero_bits = std::max(std::stoi(arg.substr(7)), 1);
+        } else if ((arg == "--hex" || arg == "-x") && i + 1 < argc) {
+            target_zero_bits = std::max(std::stoi(argv[++i]) * 4, 1);
+        } else if (arg.rfind("--hex=", 0) == 0) {
+            target_zero_bits = std::max(std::stoi(arg.substr(6)) * 4, 1);
+        } else if (arg == "--verbose" || arg == "-v") {
             verbose = true;
-            continue;
+        } else if ((arg == "--verify" || arg == "-V") && i + 1 < argc) {
+            verify_proof = argv[++i];
+        } else if (arg.rfind("--verify=", 0) == 0) {
+            verify_proof = arg.substr(9);
+        } else if (arg[0] != '-') {
+            if (username == DEFAULT_USERNAME) username = arg;
+            else target_zero_bits = std::max(std::stoi(arg), 1);
         }
-
-        if (arg == "--verify" || arg == "-V") {
-            verify_proof = require_next_arg();
-            continue;
-        }
-        if (arg.rfind("--verify=", 0) == 0) {
-            verify_proof = arg.substr(VERIFY_PREFIX_LEN);
-            continue;
-        }
-
-        if (!arg.empty() && arg[0] == '-') {
-            std::cerr << "Unknown option: " << arg << std::endl;
-            std::exit(1);
-        }
-
-        positional.push_back(arg);
     }
 
-    if (!positional.empty()) {
-        username = positional[0];
-    }
-    if (positional.size() > 1) {
-        parse_bits_value(positional[1], 1);
+    // Discover GPUs first (needed for both verify and mining)
+    std::vector<cl_device_id> devices = discover_all_gpus();
+    if (devices.empty()) {
+        std::cerr << "No GPUs found!" << std::endl;
+        return 1;
     }
 
-    // Verify mode: parse proof, verify, and exit
+    // Initialize first GPU for weight generation
+    std::vector<std::unique_ptr<GPUContext>> gpus;
+    gpus.push_back(std::make_unique<GPUContext>());
+    if (!create_gpu_context(devices[0], 0, *gpus[0])) {
+        std::cerr << "Failed to initialize GPU" << std::endl;
+        return 1;
+    }
+
+    // Generate weights on GPU
+    std::cout << "Generating weights on GPU from epoch: " << WEIGHT_EPOCH << std::endl;
+    std::vector<int8_t> weights;
+    if (!generate_weights_gpu(*gpus[0], WEIGHT_EPOCH, weights)) {
+        std::cerr << "Failed to generate weights" << std::endl;
+        return 1;
+    }
+    std::cout << "Generated " << weights.size() << " weight bytes" << std::endl;
+
+    // Setup weights buffer for first GPU
+    setup_weights_buffer(*gpus[0], weights);
+
+    // Verify mode
     if (!verify_proof.empty()) {
-        // Parse proof: username/nonce (nonce can be ANY string)
         size_t slash_pos = verify_proof.find('/');
         if (slash_pos == std::string::npos) {
             std::cerr << "Invalid proof format. Expected: username/nonce" << std::endl;
@@ -1013,37 +528,26 @@ int main(int argc, char* argv[]) {
         std::string proof_username = verify_proof.substr(0, slash_pos);
         std::string nonce_str = verify_proof.substr(slash_pos + 1);
 
-        if (nonce_str.empty()) {
-            std::cerr << "Nonce cannot be empty" << std::endl;
+        std::vector<uint8_t> nonce(nonce_str.begin(), nonce_str.end());
+
+        VerifyResult vr;
+        if (!verify_nonce_gpu(*gpus[0], nonce, vr)) {
+            std::cerr << "Verification failed" << std::endl;
             return 1;
         }
 
-        // Treat nonce as raw bytes (any string works!)
-        std::vector<uint8_t> nonce(nonce_str.begin(), nonce_str.end());
-
-        // Generate weights
-        std::vector<int8_t> weights;
-        generate_weights(WEIGHT_EPOCH, weights);
-
-        // Run forward pass (nonce gets SHA-256 expanded to 64 bytes internally)
-        float outputs[OUTPUT_DIM];
-        cpu_verifier::forward_pass(weights.data(), nonce.data(), nonce.size(), outputs);
-        uint8_t digest[DIGEST_BYTES];
-        cpu_verifier::compute_digest(outputs, digest, OUTPUT_DIM);
-        int lz_bits = cpu_verifier::count_leading_zero_bits(digest, DIGEST_BYTES);
-        std::string digest_hex = bytes_to_hex(digest, DIGEST_BYTES);
+        std::string digest_hex = bytes_to_hex(vr.digest.data(), DIGEST_BYTES);
 
         std::cout << "Proof Verification" << std::endl;
         std::cout << "==================" << std::endl;
         std::cout << "Username: " << proof_username << std::endl;
         std::cout << "Nonce: " << nonce_str << " (" << nonce_str.size() << " bytes)" << std::endl;
-        std::cout << "Digest: " << format_digest_with_marker(digest_hex, lz_bits) << std::endl;
-        std::cout << "Result: " << describe_lz_bits(lz_bits) << std::endl;
+        std::cout << "Digest: " << format_digest_with_marker(digest_hex, vr.bits) << std::endl;
+        std::cout << "Result: " << vr.bits << " bits" << std::endl;
         return 0;
     }
 
-    // Initial threshold: only report if digest has at least (target_zero_bits - 1) leading zeros
-    // Score is first 8 bytes of digest as uint64; lower = more leading zeros = better
+    // Mining mode
     int base_bits = std::max(target_zero_bits - 1, 0);
     uint64_t initial_target = (base_bits >= 64) ? 0 : (1ULL << (64 - base_bits));
 
@@ -1053,67 +557,41 @@ int main(int argc, char* argv[]) {
     shared.best_score = initial_target;
     shared.start_time = std::chrono::steady_clock::now();
 
-    int target_hex_digits = target_zero_bits / 4;
-    int target_hex_extra_bits = target_zero_bits % 4;
-
     std::cout << "Neural Proof-of-Work Miner (OpenCL)" << std::endl;
     std::cout << "Username: " << shared.username << std::endl;
-    std::cout << "Target: " << target_zero_bits << "+ leading zero bits ("
-              << target_hex_digits << " hex digit" << (target_hex_digits == 1 ? "" : "s");
-    if (target_hex_extra_bits) {
-        std::cout << " + " << target_hex_extra_bits << " bits";
-    }
-    std::cout << ")" << std::endl;
-
-    std::cout << "Generating network weights from epoch: " << WEIGHT_EPOCH << std::endl;
-    generate_weights(WEIGHT_EPOCH, shared.weights);
-    std::cout << "Generated " << shared.weights.size() << " weight bytes" << std::endl;
-
+    std::cout << "Target: " << target_zero_bits << "+ leading zero bits" << std::endl;
     std::cout << "Network: " << INPUT_DIM << " -> " << HIDDEN_DIM << " -> " << HIDDEN_DIM << " -> " << HIDDEN_DIM << " -> " << OUTPUT_DIM << std::endl;
-    std::cout << "Global size: " << GLOBAL_SIZE << " threads per launch" << std::endl;
-    std::cout << "Local size: " << LOCAL_SIZE << " threads per work-group" << std::endl;
+    std::cout << "Found " << devices.size() << " GPU(s)" << std::endl;
 
     std::signal(SIGINT, signal_handler);
     std::signal(SIGTERM, signal_handler);
 
-    std::vector<cl_device_id> devices = discover_all_gpus();
-    if (devices.empty()) {
-        std::cerr << "No GPUs found!" << std::endl;
-        return 1;
-    }
-    std::cout << "Found " << devices.size() << " GPU(s)" << std::endl;
-
-    std::vector<GPUContext> gpus(devices.size());
-    for (size_t i = 0; i < devices.size(); i++) {
-        if (!create_gpu_context(devices[i], static_cast<int>(i), shared, gpus[i])) {
+    // Initialize remaining GPUs
+    for (size_t i = 1; i < devices.size(); i++) {
+        gpus.push_back(std::make_unique<GPUContext>());
+        if (!create_gpu_context(devices[i], static_cast<int>(i), *gpus[i])) {
             std::cerr << "Failed to initialize GPU " << i << std::endl;
             return 1;
         }
-        std::cout << "Initialized GPU " << i << ": " << gpus[i].device_name << std::endl;
+        setup_weights_buffer(*gpus[i], weights);
     }
 
-    // Run determinism test to verify CPU consistency
-    if (!run_determinism_test(shared)) {
-        std::cerr << "Determinism test failed! Aborting." << std::endl;
-        return 1;
+    for (auto& gpu : gpus) {
+        std::cout << "Initialized GPU " << gpu->device_index << ": " << gpu->device_name << std::endl;
     }
 
     std::cout << "\nMining started...\n" << std::endl;
 
     std::vector<std::thread> worker_threads;
     for (auto& gpu : gpus) {
-        worker_threads.emplace_back(gpu_worker_thread, std::ref(gpu), std::ref(shared));
+        worker_threads.emplace_back(gpu_worker_thread, std::ref(*gpu), std::ref(shared));
     }
 
-    // Stats tracking with exponential moving average for smooth reporting
+    // Stats loop
     uint64_t last_total = 0;
     auto last_time = std::chrono::steady_clock::now();
-    double smoothed_rate = 0.0;  // EMA of evals/s
-    constexpr double EMA_ALPHA = 0.1;  // Smoothing factor (0.1 = heavy smoothing)
-    constexpr int WARMUP_SAMPLES = 5;  // Discard first N samples for accurate measurement
-    int sample_count = 0;
-    uint64_t post_warmup_evals = 0;  // Evals counted after warmup
-    auto post_warmup_time = std::chrono::steady_clock::now();
+    double smoothed_rate = 0.0;
+    constexpr double EMA_ALPHA = 0.1;
 
     while (shared.running.load()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1000));
@@ -1124,85 +602,43 @@ int main(int argc, char* argv[]) {
             break;
         }
 
-        // Gather stats from all GPUs
         uint64_t total_evals = 0;
         uint64_t total_matches = 0;
-        uint64_t total_launches = 0;
         for (const auto& gpu : gpus) {
-            total_evals += gpu.evals_computed.load();
-            total_matches += gpu.matches_found.load();
-            total_launches += gpu.launch_counter.load();
+            total_evals += gpu->evals_computed.load();
+            total_matches += gpu->matches_found.load();
         }
 
         auto now = std::chrono::steady_clock::now();
         auto elapsed_total = std::chrono::duration_cast<std::chrono::seconds>(now - shared.start_time).count();
         auto interval_us = std::chrono::duration_cast<std::chrono::microseconds>(now - last_time).count();
 
-        // Calculate instantaneous rate
         double instant_rate = 0.0;
         if (interval_us > 0 && total_evals > last_total) {
             instant_rate = static_cast<double>(total_evals - last_total) / (interval_us / 1e6);
         }
 
-        // Track samples and handle warmup
-        if (total_evals > last_total) {
-            sample_count++;
-        }
-        bool in_warmup = (sample_count <= WARMUP_SAMPLES);
-
-        // Update exponential moving average (only after warmup)
-        if (!in_warmup && instant_rate > 0) {
-            if (smoothed_rate == 0.0) {
-                // First post-warmup sample - initialize EMA and tracking
-                smoothed_rate = instant_rate;
-                post_warmup_evals = total_evals;
-                post_warmup_time = now;
-            } else {
-                smoothed_rate = EMA_ALPHA * instant_rate + (1.0 - EMA_ALPHA) * smoothed_rate;
-            }
+        if (instant_rate > 0) {
+            smoothed_rate = (smoothed_rate == 0.0) ? instant_rate : (EMA_ALPHA * instant_rate + (1.0 - EMA_ALPHA) * smoothed_rate);
         }
 
         last_total = total_evals;
         last_time = now;
 
-        // Get current best
-        int current_bits = 0;
+        int current_bits;
         {
             std::lock_guard<std::mutex> lock(shared.best_mutex);
-            current_bits = cpu_verifier::score_to_lz_bits(shared.best_score);
-        }
-
-        // Calculate average rate (post-warmup for accuracy)
-        double avg_rate = 0.0;
-        if (!in_warmup) {
-            auto post_warmup_elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - post_warmup_time).count();
-            uint64_t post_warmup_delta = total_evals - post_warmup_evals;
-            if (post_warmup_elapsed > 0) {
-                avg_rate = static_cast<double>(post_warmup_delta) / post_warmup_elapsed;
-            }
+            current_bits = score_to_lz_bits(shared.best_score);
         }
 
         if (total_evals > 0) {
-            if (in_warmup) {
-                std::cout << "\r[Warmup " << sample_count << "/" << WARMUP_SAMPLES << "] "
-                          << std::fixed << std::setprecision(2) << (instant_rate / 1e6) << " M/s"
-                          << " | " << std::setprecision(3) << (total_evals / 1e9) << "B total"
-                          << " | best=" << current_bits << " bits"
-                          << " | " << elapsed_total << "s"
-                          << "        " << std::flush;
-            } else {
-                std::cout << "\r[Stats] " << std::fixed << std::setprecision(2)
-                          << (smoothed_rate / 1e6) << " M/s"
-                          << " (avg " << std::setprecision(2) << (avg_rate / 1e6) << ")"
-                          << " | " << std::setprecision(3) << (total_evals / 1e9) << "B total"
-                          << " | best=" << current_bits << " bits"
-                          << " | " << total_matches << " hits"
-                          << " | " << total_launches << " batches"
-                          << " | " << elapsed_total << "s"
-                          << "        " << std::flush;
-            }
-        } else {
-            std::cout << "\r[Stats] Waiting for first kernel... " << elapsed_total << "s" << std::flush;
+            std::cout << "\r[Stats] " << std::fixed << std::setprecision(2)
+                      << (smoothed_rate / 1e6) << " M/s"
+                      << " | " << std::setprecision(3) << (total_evals / 1e9) << "B total"
+                      << " | best=" << current_bits << " bits"
+                      << " | " << total_matches << " hits"
+                      << " | " << elapsed_total << "s"
+                      << "        " << std::flush;
         }
     }
 
@@ -1210,31 +646,20 @@ int main(int argc, char* argv[]) {
         t.join();
     }
 
+    // Final results
     std::cout << "\n\n========================================" << std::endl;
     std::cout << "Final Results" << std::endl;
     std::cout << "========================================" << std::endl;
     std::cout << "Username: " << shared.username << std::endl;
 
     if (!shared.best_nonce.empty()) {
-        float outputs[OUTPUT_DIM];
-        cpu_verifier::forward_pass(shared.weights.data(), shared.best_nonce.data(), shared.best_nonce.size(), outputs);
-        uint8_t digest[DIGEST_BYTES];
-        cpu_verifier::compute_digest(outputs, digest, OUTPUT_DIM);
-        int lz_bits = cpu_verifier::count_leading_zero_bits(digest, DIGEST_BYTES);
-        std::string digest_hex = bytes_to_hex(digest, DIGEST_BYTES);
+        std::string digest_hex = bytes_to_hex(shared.best_digest.data(), shared.best_digest.size());
+        int lz_bits = count_leading_zero_bits(shared.best_digest.data(), shared.best_digest.size());
         std::string nonce_str(reinterpret_cast<char*>(shared.best_nonce.data()), shared.best_nonce.size());
 
-        std::cout << "\nBest Result: " << describe_lz_bits(lz_bits) << std::endl;
+        std::cout << "\nBest Result: " << lz_bits << " bits" << std::endl;
         std::cout << "Digest: " << format_digest_with_marker(digest_hex, lz_bits) << std::endl;
         std::cout << "Proof: " << shared.username << "/" << nonce_str << std::endl;
-        if (shared.verbose) {
-            std::cout << "Output: [";
-            for (size_t i = 0; i < OUTPUT_DIM; i++) {
-                std::cout << std::fixed << std::setprecision(4) << std::setw(8) << outputs[i];
-                if (i < OUTPUT_DIM - 1) std::cout << ", ";
-            }
-            std::cout << "]" << std::endl;
-        }
     } else {
         std::cout << "\nNo valid result found." << std::endl;
     }

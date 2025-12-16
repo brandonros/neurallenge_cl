@@ -590,3 +590,86 @@ __kernel void neural_pow_mine(
         }
     }
 }
+
+// ============================================================================
+// Verification Kernel - Single nonce verification
+// ============================================================================
+
+__kernel void neural_pow_verify(
+    __global const char* weights,
+    __global const uchar* in_nonce,
+    uint nonce_len,
+    __global ulong* out_score,
+    __global uchar* out_digest
+) {
+    // Copy nonce to private memory
+    uchar nonce[64];  // Max nonce length
+    for (uint i = 0; i < nonce_len && i < 64; i++) {
+        nonce[i] = in_nonce[i];
+    }
+
+    // Activation buffers
+    float input[INPUT_DIM];
+    float hidden1[HIDDEN_DIM];
+    float hidden2[HIDDEN_DIM];
+    float hidden3[HIDDEN_DIM];
+    float output[OUTPUT_DIM];
+
+    // Convert nonce to input
+    nonce_to_input(nonce, nonce_len, input);
+
+    // Forward pass
+    layer_forward(weights + W1_OFFSET, weights + B1_OFFSET, input, hidden1, INPUT_DIM, HIDDEN_DIM, 1);
+    layer_forward(weights + W2_OFFSET, weights + B2_OFFSET, hidden1, hidden2, HIDDEN_DIM, HIDDEN_DIM, 1);
+    layer_forward(weights + W3_OFFSET, weights + B3_OFFSET, hidden2, hidden3, HIDDEN_DIM, HIDDEN_DIM, 1);
+    layer_forward(weights + W4_OFFSET, weights + B4_OFFSET, hidden3, output, HIDDEN_DIM, OUTPUT_DIM, 0);
+
+    // Compute and output score
+    *out_score = compute_score(output, OUTPUT_DIM);
+
+    // Compute and output full digest
+    uchar digest[DIGEST_BYTES];
+    compute_digest(output, digest, OUTPUT_DIM);
+    for (uint i = 0; i < DIGEST_BYTES; i++) {
+        out_digest[i] = digest[i];
+    }
+}
+
+// ============================================================================
+// Weight Generation Kernel - Generate weights from epoch string via SHA256
+// ============================================================================
+
+__kernel void generate_weights_kernel(
+    __global const uchar* epoch,
+    uint epoch_len,
+    __global char* weights
+) {
+    // Each work-item generates 32 bytes of weights
+    uint idx = get_global_id(0);
+    uint weight_offset = idx * 32;
+
+    if (weight_offset >= TOTAL_WEIGHTS) return;
+
+    // Build input: epoch || counter (little-endian)
+    uchar buf[64];  // epoch (up to 55 bytes) + 4 byte counter
+    for (uint i = 0; i < epoch_len && i < 55; i++) {
+        buf[i] = epoch[i];
+    }
+    buf[epoch_len + 0] = (uchar)(idx & 0xFF);
+    buf[epoch_len + 1] = (uchar)((idx >> 8) & 0xFF);
+    buf[epoch_len + 2] = (uchar)((idx >> 16) & 0xFF);
+    buf[epoch_len + 3] = (uchar)((idx >> 24) & 0xFF);
+
+    // SHA256
+    uchar hash[32];
+    sha256_short(buf, epoch_len + 4, hash);
+
+    // Copy to weights, clamping -128 to -127
+    uint remaining = TOTAL_WEIGHTS - weight_offset;
+    uint to_copy = min(remaining, 32u);
+    for (uint i = 0; i < to_copy; i++) {
+        char w = (char)hash[i];
+        if (w == -128) w = -127;
+        weights[weight_offset + i] = w;
+    }
+}

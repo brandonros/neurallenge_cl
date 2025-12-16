@@ -63,12 +63,12 @@ $(MINER): $(OUTDIR)/miner.o
 $(OUTDIR)/miner.o: src/miner.cpp src/config.h $(OUTDIR)/kernel_embedded.h | $(OUTDIR)
 	$(CC) $(CFLAGS) $(CDEFINES) -I$(OUTDIR) -Isrc $< -o $@
 
-# Server (HTTP + verifier)
+# Server (HTTP + OpenCL verifier)
 $(SERVER): $(OUTDIR)/server.o
-	$(CC) $< -pthread -o $@
+	$(CC) $< $(LDFLAGS) -o $@
 
-$(OUTDIR)/server.o: src/server.cpp src/config.h | $(OUTDIR)
-	$(CC) $(CFLAGS) $(CDEFINES) -Isrc -Ivendor $< -o $@
+$(OUTDIR)/server.o: src/server.cpp src/config.h $(OUTDIR)/kernel_embedded.h | $(OUTDIR)
+	$(CC) $(CFLAGS) $(CDEFINES) -I$(OUTDIR) -Isrc -Ivendor $< -o $@
 
 clean:
 	rm -rf $(OUTDIR)
