@@ -26,7 +26,7 @@
 
 using json = nlohmann::json;
 
-constexpr int MIN_BITS = 28;
+constexpr int MIN_BITS = 16;
 constexpr int SERVER_PORT = 8080;
 constexpr const char* PROOFS_FILE = "proofs.jsonl";
 constexpr const char* WEIGHT_EPOCH = "epoch0";
@@ -244,10 +244,12 @@ struct ServerState {
 // Signal Handling
 // ============================================================================
 
-volatile std::sig_atomic_t g_shutdown = 0;
+httplib::Server* g_server = nullptr;
 
 void signal_handler(int) {
-    g_shutdown = 1;
+    if (g_server) {
+        g_server->stop();
+    }
 }
 
 // ============================================================================
@@ -401,7 +403,9 @@ int main(int argc, char* argv[]) {
     std::cout << "  GET  /health - Health check" << std::endl;
     std::cout << "  GET  /stats  - Server statistics" << std::endl;
     std::cout << "  POST /submit - Submit proof {wallet, nonce}" << std::endl;
+    std::cout << "Press Ctrl+C to stop." << std::endl;
 
+    g_server = &svr;
     svr.listen("0.0.0.0", port);
 
     state.proof_log.close();

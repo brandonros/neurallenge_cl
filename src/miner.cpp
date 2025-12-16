@@ -590,9 +590,6 @@ int main(int argc, char* argv[]) {
     shared.best_score = initial_target;
     shared.start_time = std::chrono::steady_clock::now();
 
-    // Setup mining args for first GPU (wallet for proof binding)
-    setup_mining_args(*gpus[0], username);
-
     std::cout << "Neural Proof-of-Work Miner (OpenCL)" << std::endl;
     std::cout << "Username: " << shared.username << std::endl;
     std::cout << "Target: " << target_zero_bits << "+ leading zero bits" << std::endl;
@@ -602,7 +599,7 @@ int main(int argc, char* argv[]) {
     std::signal(SIGINT, signal_handler);
     std::signal(SIGTERM, signal_handler);
 
-    // Initialize remaining GPUs
+    // Initialize remaining GPUs and set mining args for all
     for (size_t i = 1; i < devices.size(); i++) {
         gpus.push_back(std::make_unique<GPUContext>());
         if (!create_gpu_context(devices[i], static_cast<int>(i), *gpus[i])) {
@@ -610,7 +607,11 @@ int main(int argc, char* argv[]) {
             return 1;
         }
         setup_weights_buffer(*gpus[i], weights);
-        setup_mining_args(*gpus[i], username);
+    }
+
+    // Setup mining args for all GPUs (wallet for proof binding)
+    for (auto& gpu : gpus) {
+        setup_mining_args(*gpu, username);
     }
 
     for (auto& gpu : gpus) {
