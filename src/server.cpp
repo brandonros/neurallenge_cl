@@ -27,7 +27,27 @@
 
 using json = nlohmann::json;
 
-constexpr int MIN_BITS = 16;
+// ============================================================================
+// Tokenomics
+// ============================================================================
+//
+// Hardware benchmark: 4x RTX 5090 @ ~27 MH/s for ~$1.15/hr (vast.ai)
+// Observed: 32 bits in ~220s, 34 bits in ~362s
+//
+// Difficulty scaling (each +1 bit = 2x harder):
+//   32 bits: 2^32 / 27M = ~160 sec → ~22 proofs/hr → ~$0.05/proof
+//   40 bits: 2^40 / 27M = ~11 hrs  → ~$13/proof
+//   48 bits: 2^48 / 27M = ~121 days → ~$3,300/proof
+//
+// Reward formula: 1.5^(bits - MIN_BITS)
+//   32 bits = 1.0 tokens      (baseline, ~$0.05 cost)
+//   40 bits = 25.6 tokens     (~$0.51/token cost)
+//   48 bits = 656.8 tokens    (~$5.03/token cost)
+//
+// Using 1.5x per bit (not 2x) so rewards grow slower than difficulty,
+// making higher bits progressively more valuable per token.
+//
+constexpr int MIN_BITS = 32;
 constexpr int SERVER_PORT = 8080;
 constexpr const char* PROOFS_FILE = "proofs.jsonl";
 constexpr const char* WEIGHT_EPOCH = "epoch0";
@@ -56,6 +76,8 @@ int count_leading_zero_bits(const uint8_t* digest, size_t len) {
     return bits;
 }
 
+// Reward grows 1.5x per bit (slower than 2x difficulty growth)
+// See tokenomics comment above for cost/reward analysis
 double compute_reward(int bits) {
     if (bits < MIN_BITS) return 0.0;
     return std::pow(1.5, bits - MIN_BITS);

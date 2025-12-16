@@ -1,8 +1,8 @@
 #!/bin/bash
 
 export SSH_USERNAME="root"
-export SSH_PORT="27651"
-export SSH_HOST="74.48.140.178"
+export SSH_PORT="11357"
+export SSH_HOST="70.69.213.236"
 
 # sync files
 rsync -avz --exclude='.git' --exclude='.DS_Store' --exclude='output' -e "ssh -p $SSH_PORT" . $SSH_USERNAME@$SSH_HOST:/workspace/neurallenge_cl
