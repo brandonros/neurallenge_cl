@@ -37,10 +37,15 @@ endif
 # -frounding-math: Ensures compiler respects fesetround() rounding mode changes
 CFLAGS=-c -std=c++17 -Wall -O3 -march=native -pthread -ffp-contract=off -fno-fast-math -frounding-math
 
-# Executable
-EXE=$(OUTDIR)/neurallenge
+# Executables
+MINER=$(OUTDIR)/neurallenge
+SERVER=$(OUTDIR)/neurallenge-server
 
-all: $(OUTDIR) $(EXE)
+all: $(OUTDIR) $(MINER)
+
+miner: $(MINER)
+
+server: $(SERVER)
 
 $(OUTDIR):
 	mkdir -p $(OUTDIR)
@@ -51,13 +56,21 @@ $(OUTDIR)/kernel_embedded.h: src/config.h src/kernel.cl | $(OUTDIR)
 	xxd -i $(OUTDIR)/kernel_combined.cl > $@
 	sed -i.bak 's/output_kernel_combined_cl/kernel_cl/g' $@ && rm -f $@.bak
 
-$(EXE): $(OUTDIR)/main.o
+# Miner (GPU)
+$(MINER): $(OUTDIR)/miner.o
 	$(CC) $< $(LDFLAGS) -o $@
 
-$(OUTDIR)/main.o: src/main.cpp src/config.h $(OUTDIR)/kernel_embedded.h | $(OUTDIR)
+$(OUTDIR)/miner.o: src/miner.cpp src/config.h $(OUTDIR)/kernel_embedded.h | $(OUTDIR)
 	$(CC) $(CFLAGS) $(CDEFINES) -I$(OUTDIR) -Isrc $< -o $@
+
+# Server (HTTP + verifier)
+$(SERVER): $(OUTDIR)/server.o
+	$(CC) $< -pthread -o $@
+
+$(OUTDIR)/server.o: src/server.cpp src/config.h | $(OUTDIR)
+	$(CC) $(CFLAGS) $(CDEFINES) -Isrc -Ivendor $< -o $@
 
 clean:
 	rm -rf $(OUTDIR)
 
-.PHONY: all clean
+.PHONY: all clean miner server
