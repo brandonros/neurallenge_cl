@@ -44,7 +44,7 @@
 #define B4_OFFSET (W4_OFFSET + W4_SIZE)
 
 // Result buffer limits
-#define MAX_RESULTS 64
+#define MAX_RESULTS 16
 
 // SipHash keys (derived from "NeuralPoW Digest" ASCII)
 #define SIPHASH_K0 0x4e657572616c506fUL

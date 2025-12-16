@@ -519,8 +519,8 @@ __kernel void neural_pow_mine(
     uint seed_lo,
     uint seed_hi,
     FOUND_COUNT_T found_count,       // Atomic counter (CL1.2 or CL2.0+ via shim)
-    __global ulong* found_scores,    // First 8 bytes of digest
-    __global uchar* found_nonces
+    __global uchar* found_nonces,
+    __global uchar* found_digests    // Full DIGEST_BYTES digest for each result
 ) {
     uint thread_idx = (uint)get_global_id(0);
 
@@ -580,12 +580,19 @@ __kernel void neural_pow_mine(
             uint slot = reserve_slot(found_count);
 
             if (slot < MAX_RESULTS) {
-                found_scores[slot] = score;
-
                 // Vectorized nonce copy (NONCE_BYTES=16 = 2x uchar8)
                 __global uchar* nonce_out = found_nonces + slot * NONCE_BYTES;
                 vstore8(vload8(0, nonce), 0, nonce_out);
                 vstore8(vload8(0, nonce + 8), 0, nonce_out + 8);
+
+                // Compute and store full digest
+                uchar digest[DIGEST_BYTES];
+                compute_digest(output, digest, OUTPUT_DIM);
+                __global uchar* digest_out = found_digests + slot * DIGEST_BYTES;
+                vstore8(vload8(0, digest), 0, digest_out);
+                vstore8(vload8(0, digest + 8), 0, digest_out + 8);
+                vstore8(vload8(0, digest + 16), 0, digest_out + 16);
+                vstore8(vload8(0, digest + 24), 0, digest_out + 24);
             }
         }
     }
