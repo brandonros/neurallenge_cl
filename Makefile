@@ -1,19 +1,17 @@
 CC=g++
 
-# Configuration - Tuned for RTX 5090 (4x GPU setup)
+# Configuration - Tuned for Apple M4
 # GLOBAL_SIZE: Total work-items per kernel launch (per GPU)
-#   - Higher = more parallelism, but longer kernel time
-#   - RTX 5090 has 21760 CUDA cores, can handle 200K+ concurrent threads
+#   - M4 has ~10 GPU cores (~1280 ALUs) - much smaller than discrete GPUs
 # LOCAL_SIZE: Work-items per work-group
-#   - Must divide GLOBAL_SIZE evenly
-#   - 128-256 typically optimal for modern NVIDIA GPUs
+#   - Apple GPUs prefer smaller workgroups (64 typical)
 # HASHES_PER_THREAD: Nonces evaluated per work-item
 #   - Higher = better weight cache reuse, fewer kernel launches
 #   - Too high = longer kernel time, less responsive target updates
 DEFAULT_USERNAME ?= brandonros
-GLOBAL_SIZE ?= 131072
-LOCAL_SIZE ?= 128
-HASHES_PER_THREAD ?= 128
+GLOBAL_SIZE ?= 8192
+LOCAL_SIZE ?= 64
+HASHES_PER_THREAD ?= 64
 
 CDEFINES=-DCL_TARGET_OPENCL_VERSION=300 \
          -DDEFAULT_USERNAME=\"$(DEFAULT_USERNAME)\" \

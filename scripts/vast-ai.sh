@@ -21,7 +21,7 @@ apt-get install -y xxd
 # build project
 cd /workspace/neurallenge_cl
 make clean
-make
+make GLOBAL_SIZE=131072 LOCAL_SIZE=128 HASHES_PER_THREAD=128
 
 # run
 ./output/neurallenge
