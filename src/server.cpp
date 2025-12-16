@@ -28,25 +28,67 @@
 using json = nlohmann::json;
 
 // ============================================================================
-// Tokenomics
+// Tokenomics (corrected for continuous rewards)
 // ============================================================================
 //
-// Hardware benchmark: 4x RTX 5090 @ ~27 MH/s for ~$1.15/hr (vast.ai)
-// Observed: 32 bits in ~220s, 34 bits in ~362s
+// Hardware benchmark:
+//   4x RTX 5090 @ ~27 MH/s for ~$0.88/hr (vast.ai interruptible)
 //
-// Difficulty scaling (each +1 bit = 2x harder):
-//   32 bits: 2^32 / 27M = ~160 sec → ~22 proofs/hr → ~$0.05/proof
-//   40 bits: 2^40 / 27M = ~11 hrs  → ~$13/proof
-//   48 bits: 2^48 / 27M = ~121 days → ~$3,300/proof
+// Observed performance:
+//   32 bits ≈ 160–220s
+//   34 bits ≈ 360s
 //
-// Reward formula: 1.5^(bits - MIN_BITS)
-//   32 bits = 1.0 tokens      (baseline, ~$0.05 cost)
-//   40 bits = 25.6 tokens     (~$0.51/token cost)
-//   48 bits = 656.8 tokens    (~$5.03/token cost)
+// Difficulty scaling (each +1 bit = 2× harder):
+//   32 bits: 2^32 / 27M ≈ 160s  → ~22 proofs/hr
+//   40 bits: ≈ 11 hours
+//   48 bits: ≈ 121 days
 //
-// Using 1.5x per bit (not 2x) so rewards grow slower than difficulty,
-// making higher bits progressively more valuable per token.
+// Reward formula:
+//   reward(bits) = 1.5^(bits - MIN_BITS)
 //
+// Base rewards:
+//   32 bits = 1.0 token
+//   40 bits = 25.6 tokens
+//   48 bits = 656.8 tokens
+//
+// --------------------------------------------------------------------------
+// IMPORTANT CORRECTION:
+// Mining for high-bit proofs earns ALL lower-bit proofs along the way.
+// A 48-bit search is NOT exclusive — it continuously yields 32+, 33+, … proofs.
+//
+// Expected proofs per hour at 27 MH/s:
+//   32 bits: ~11 proofs × 1.0   = 11.00 tokens
+//   33 bits: ~5.5  proofs × 1.5 =  8.25 tokens
+//   34 bits: ~2.75 proofs × 2.25=  6.19 tokens
+//   35 bits: ~1.38 proofs × 3.375= 4.64 tokens
+//   ...
+//
+// This forms a geometric series with ratio 0.75:
+//
+//   Total tokens/hr
+//   = 11 × (1 + 0.75 + 0.75² + …)
+//   = 11 × (1 / (1 - 0.75))
+//   ≈ 44 tokens/hour
+//
+// Effective cost:
+//   $0.88 / 44 ≈ $0.02 per token
+//
+// --------------------------------------------------------------------------
+// Long-run implication:
+//
+// 48-bit expected time: ~121 days
+// Total cost: ~$2,550
+// Tokens earned along the way: ~128,000
+// Marginal 48-bit bonus: ~657 tokens (~0.5% extra)
+//
+// Conclusion:
+//   • High-bit proofs are prestige + anti-spam signals
+//   • The real economic yield comes from cumulative lower-bit rewards
+//   • Token issuance is stable and predictable
+//   • Incentive still favors continuous honest mining, not grinding resets
+//
+// ============================================================================
+
 constexpr int MIN_BITS = 32;
 constexpr int SERVER_PORT = 8080;
 constexpr const char* PROOFS_FILE = "proofs.jsonl";
