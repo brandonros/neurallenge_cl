@@ -13,7 +13,7 @@ sleep 3
 # open shell
 ssh -p $SSH_PORT $SSH_USERNAME@$SSH_HOST << EOF
 # kill
-killall neurallenge
+killall miner
 
 # install dependencies
 apt-get install -y xxd
@@ -24,5 +24,5 @@ make clean
 make GLOBAL_SIZE=131072 LOCAL_SIZE=128 HASHES_PER_THREAD=128
 
 # run
-./output/neurallenge
+./output/miner
 EOF
