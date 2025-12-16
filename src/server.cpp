@@ -32,7 +32,7 @@ using json = nlohmann::json;
 // ============================================================================
 //
 // Hardware benchmark:
-//   4x RTX 5090 @ ~27 MH/s for ~$0.88/hr (vast.ai interruptible)
+//   4x RTX 5090 @ ~27 MH/s for ~$1.15/hr (vast.ai)
 //
 // Observed performance:
 //   32 bits ≈ 160–220s
@@ -71,14 +71,14 @@ using json = nlohmann::json;
 //   ≈ 44 tokens/hour
 //
 // Effective cost:
-//   $0.88 / 44 ≈ $0.02 per token
+//   $1.15 / 44 ≈ $0.026 per token
 //
 // --------------------------------------------------------------------------
 // Long-run implication:
 //
 // 48-bit expected time: ~121 days
-// Total cost: ~$2,550
-// Tokens earned along the way: ~128,000
+// Total cost: ~$3,300
+// Tokens earned along the way: ~131,000
 // Marginal 48-bit bonus: ~657 tokens (~0.5% extra)
 //
 // Conclusion:
@@ -86,6 +86,52 @@ using json = nlohmann::json;
 //   • The real economic yield comes from cumulative lower-bit rewards
 //   • Token issuance is stable and predictable
 //   • Incentive still favors continuous honest mining, not grinding resets
+//
+// --------------------------------------------------------------------------
+// Token Supply & Weekly Mining Estimates
+//
+// Total supply: 1,000,000,000 (1 billion) tokens
+//
+// Per 4x RTX 5090 rig (~27 MH/s):
+//   Tokens per hour:  ~44
+//   Tokens per day:   ~1,056
+//   Tokens per week:  ~7,400
+//   Cost per week:    ~$193 (at $1.15/hr on-demand)
+//
+// Weekly earnings as % of total supply:
+//   1 rig:    7,400 / 1B = 0.00074%
+//   10 rigs:  0.0074%
+//   100 rigs: 0.074%
+//
+// Time to mine entire supply (solo, 1 rig):
+//   1B / 44 tokens/hr = ~2,600 years
+//
+// This ensures:
+//   • Slow, predictable token distribution
+//   • No single miner can dominate supply quickly
+//   • Long-term sustainability of mining incentives
+//
+// --------------------------------------------------------------------------
+// Profitability Analysis
+//
+// Break-even token price:
+//   $193 / 7,400 tokens = ~$0.026/token
+//
+// Weekly profit at various token prices:
+//   $0.010/token: 7,400 × $0.010 = $74  → -$119 loss
+//   $0.015/token: 7,400 × $0.015 = $111 → -$82 loss
+//   $0.020/token: 7,400 × $0.020 = $148 → -$45 loss
+//   $0.025/token: 7,400 × $0.025 = $185 → -$8 loss
+//   $0.026/token: break-even
+//   $0.030/token: 7,400 × $0.030 = $222 → +$29 profit
+//
+// Market cap at various prices (1B supply):
+//   $0.010/token: $10M
+//   $0.015/token: $15M
+//   $0.020/token: $20M
+//   $0.025/token: $25M
+//   $0.026/token: $26M (break-even floor)
+//   $0.030/token: $30M
 //
 // ============================================================================
 
