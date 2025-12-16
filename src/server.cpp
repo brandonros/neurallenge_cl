@@ -7,6 +7,7 @@
 #include <CL/cl.h>
 #endif
 
+#include <algorithm>
 #include <chrono>
 #include <csignal>
 #include <cstdint>
@@ -231,12 +232,43 @@ bool verify_nonce_gpu(OpenCLContext& cl, const std::string& wallet, const std::v
 // Server State
 // ============================================================================
 
+struct ProofRecord {
+    int64_t timestamp;
+    std::string wallet;
+    std::string nonce;
+    int bits;
+    double reward;
+    std::string digest;
+
+    json to_json() const {
+        return {
+            {"timestamp", timestamp},
+            {"wallet", wallet},
+            {"nonce", nonce},
+            {"bits", bits},
+            {"reward", reward},
+            {"digest", digest}
+        };
+    }
+
+    static ProofRecord from_json(const json& j) {
+        return {
+            j["timestamp"].get<int64_t>(),
+            j["wallet"].get<std::string>(),
+            j["nonce"].get<std::string>(),
+            j["bits"].get<int>(),
+            j["reward"].get<double>(),
+            j["digest"].get<std::string>()
+        };
+    }
+};
+
 struct ServerState {
     OpenCLContext cl;
-    std::unordered_set<std::string> seen_nonces;
+    std::unordered_set<std::string> seen_nonces;  // O(1) duplicate check (derived from proofs)
+    std::vector<ProofRecord> proofs;
     std::mutex mutex;
     std::ofstream proof_log;
-    uint64_t total_proofs = 0;
     uint64_t total_rejected = 0;
 };
 
@@ -280,6 +312,25 @@ int main(int argc, char* argv[]) {
     }
     std::cout << "Generated " << state.cl.weights.size() << " weight bytes" << std::endl;
 
+    // Load existing proofs from file
+    {
+        std::ifstream in(PROOFS_FILE);
+        if (in.is_open()) {
+            std::string line;
+            while (std::getline(in, line)) {
+                if (line.empty()) continue;
+                try {
+                    ProofRecord p = ProofRecord::from_json(json::parse(line));
+                    state.seen_nonces.insert(p.nonce);
+                    state.proofs.push_back(p);
+                } catch (...) {
+                    // Skip malformed lines
+                }
+            }
+            std::cout << "Loaded " << state.proofs.size() << " existing proofs from " << PROOFS_FILE << std::endl;
+        }
+    }
+
     state.proof_log.open(PROOFS_FILE, std::ios::app);
     if (!state.proof_log.is_open()) {
         std::cerr << "Failed to open " << PROOFS_FILE << std::endl;
@@ -297,11 +348,27 @@ int main(int argc, char* argv[]) {
     svr.Get("/stats", [&state](const httplib::Request&, httplib::Response& res) {
         std::lock_guard<std::mutex> lock(state.mutex);
         json j;
-        j["total_proofs"] = state.total_proofs;
+        j["total_proofs"] = state.proofs.size();
         j["total_rejected"] = state.total_rejected;
-        j["seen_nonces"] = state.seen_nonces.size();
         j["min_bits"] = MIN_BITS;
         res.set_content(j.dump(), "application/json");
+    });
+
+    // Proofs (sorted by bits descending)
+    svr.Get("/proofs", [&state](const httplib::Request&, httplib::Response& res) {
+        std::lock_guard<std::mutex> lock(state.mutex);
+
+        // Copy and sort by bits descending
+        std::vector<ProofRecord> sorted = state.proofs;
+        std::sort(sorted.begin(), sorted.end(), [](const ProofRecord& a, const ProofRecord& b) {
+            return a.bits > b.bits;
+        });
+
+        json arr = json::array();
+        for (const auto& p : sorted) {
+            arr.push_back(p.to_json());
+        }
+        res.set_content(arr.dump(), "application/json");
     });
 
     // Submit proof
@@ -320,74 +387,62 @@ int main(int argc, char* argv[]) {
 
             std::string wallet = body["wallet"];
             std::string nonce_str = body["nonce"];
+            std::vector<uint8_t> nonce(nonce_str.begin(), nonce_str.end());
+
+            // Hold lock for entire verification + storage to prevent TOCTOU race
+            std::lock_guard<std::mutex> lock(state.mutex);
 
             // Check for duplicate
-            {
-                std::lock_guard<std::mutex> lock(state.mutex);
-                if (state.seen_nonces.count(nonce_str)) {
-                    response["error"] = "duplicate nonce";
-                    state.total_rejected++;
-                    res.status = 400;
-                    res.set_content(response.dump(), "application/json");
-                    return;
-                }
-            }
-
-            // Verify proof on GPU
-            std::vector<uint8_t> nonce(nonce_str.begin(), nonce_str.end());
-            VerifyResult vr;
-
-            {
-                std::lock_guard<std::mutex> lock(state.mutex);
-                if (!verify_nonce_gpu(state.cl, wallet, nonce, vr)) {
-                    response["error"] = "verification failed";
-                    state.total_rejected++;
-                    res.status = 500;
-                    res.set_content(response.dump(), "application/json");
-                    return;
-                }
-            }
-
-            if (vr.bits < MIN_BITS) {
-                response["error"] = "difficulty too low";
-                response["bits"] = vr.bits;
-                response["min_bits"] = MIN_BITS;
-                std::lock_guard<std::mutex> lock(state.mutex);
+            if (state.seen_nonces.count(nonce_str)) {
+                response["error"] = "duplicate nonce";
                 state.total_rejected++;
                 res.status = 400;
                 res.set_content(response.dump(), "application/json");
                 return;
             }
 
-            double reward = compute_reward(vr.bits);
-            std::string digest_hex = bytes_to_hex(vr.digest.data(), DIGEST_BYTES);
-            auto now = std::chrono::system_clock::now();
-            auto timestamp = std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count();
-
-            // Log proof
-            {
-                std::lock_guard<std::mutex> lock(state.mutex);
-                state.seen_nonces.insert(nonce_str);
-                state.total_proofs++;
-
-                json proof;
-                proof["timestamp"] = timestamp;
-                proof["wallet"] = wallet;
-                proof["nonce"] = nonce_str;
-                proof["bits"] = vr.bits;
-                proof["reward"] = reward;
-                proof["digest"] = digest_hex;
-
-                state.proof_log << proof.dump() << std::endl;
-                state.proof_log.flush();
-
-                std::cout << "[Proof] " << vr.bits << " bits | wallet=" << wallet.substr(0, 8) << "... | reward=" << reward << std::endl;
+            // Verify proof on GPU
+            VerifyResult vr;
+            if (!verify_nonce_gpu(state.cl, wallet, nonce, vr)) {
+                response["error"] = "verification failed";
+                state.total_rejected++;
+                res.status = 500;
+                res.set_content(response.dump(), "application/json");
+                return;
             }
 
+            if (vr.bits < MIN_BITS) {
+                response["error"] = "difficulty too low";
+                response["bits"] = vr.bits;
+                response["min_bits"] = MIN_BITS;
+                state.total_rejected++;
+                res.status = 400;
+                res.set_content(response.dump(), "application/json");
+                return;
+            }
+
+            // Accept proof
+            auto now = std::chrono::system_clock::now();
+            ProofRecord proof = {
+                std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count(),
+                wallet,
+                nonce_str,
+                vr.bits,
+                compute_reward(vr.bits),
+                bytes_to_hex(vr.digest.data(), DIGEST_BYTES)
+            };
+
+            state.seen_nonces.insert(proof.nonce);
+            state.proofs.push_back(proof);
+            state.proof_log << proof.to_json().dump() << std::endl;
+            state.proof_log.flush();
+
+            std::cout << "[Proof] " << proof.bits << " bits | wallet=" << proof.wallet << " | reward=" << proof.reward << std::endl;
+
             response["success"] = true;
-            response["bits"] = vr.bits;
-            response["reward"] = reward;
-            response["digest"] = digest_hex;
+            response["bits"] = proof.bits;
+            response["reward"] = proof.reward;
+            response["digest"] = proof.digest;
             res.set_content(response.dump(), "application/json");
 
         } catch (const std::exception& e) {
@@ -402,6 +457,7 @@ int main(int argc, char* argv[]) {
     std::cout << "Endpoints:" << std::endl;
     std::cout << "  GET  /health - Health check" << std::endl;
     std::cout << "  GET  /stats  - Server statistics" << std::endl;
+    std::cout << "  GET  /proofs - All proofs (sorted by bits)" << std::endl;
     std::cout << "  POST /submit - Submit proof {wallet, nonce}" << std::endl;
     std::cout << "Press Ctrl+C to stop." << std::endl;
 

@@ -29,19 +29,20 @@ Like Shallenge, but with a neural network in the middle:
 
 ```bash
 make
-./output/neurallenge brandonros --bits 24
+./output/miner -u brandonros -b 24
 ```
 
 ## Usage
 
 ```
-./output/neurallenge [OPTIONS] [USERNAME] [BITS]
+./output/miner [OPTIONS]
 
 Options:
-  -u, --user STRING        Username (default: from Makefile)
-  -b, --bits N             Target leading zero bits
-  -x, --hex N              Target leading zero hex digits (N*4 bits)
-  -v, --verbose            Show network outputs
+  -u, --user STRING   Username (default: from Makefile)
+  -b, --bits N        Target leading zero bits (default: 16)
+  -x, --hex N         Target leading zero hex digits (N*4 bits)
+  -v, --verbose       Show network outputs
+  -h, --help          Show help
 ```
 
 ## Verifying a proof

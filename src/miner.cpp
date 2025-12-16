@@ -108,7 +108,6 @@ struct GPUContext {
     cl_command_queue queue;
     cl_program program;
     cl_kernel mine_kernel;
-    cl_kernel verify_kernel;
     cl_mem weights_buf;
     cl_mem wallet_buf;
     cl_uint wallet_len;
@@ -193,65 +192,6 @@ bool generate_weights_gpu(GPUContext& ctx, const std::string& epoch, std::vector
     return err == CL_SUCCESS;
 }
 
-// Verify a nonce on GPU, returns (score, digest, bits)
-struct VerifyResult {
-    uint64_t score;
-    std::vector<uint8_t> digest;
-    int bits;
-};
-
-bool verify_nonce_gpu(GPUContext& ctx, const std::string& wallet, const std::vector<uint8_t>& nonce, VerifyResult& result) {
-    cl_int err;
-
-    // Create buffers
-    cl_mem wallet_buf = clCreateBuffer(ctx.context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-                                        wallet.size(), (void*)wallet.data(), &err);
-    cl_mem nonce_buf = clCreateBuffer(ctx.context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-                                       nonce.size(), (void*)nonce.data(), &err);
-    cl_mem score_buf = clCreateBuffer(ctx.context, CL_MEM_WRITE_ONLY, sizeof(cl_ulong), nullptr, &err);
-    cl_mem digest_buf = clCreateBuffer(ctx.context, CL_MEM_WRITE_ONLY, DIGEST_BYTES, nullptr, &err);
-    if (err != CL_SUCCESS) {
-        std::cerr << "Failed to create verify buffers" << std::endl;
-        return false;
-    }
-
-    // Set args: weights, wallet, wallet_len, nonce, nonce_len, score, digest
-    cl_uint wallet_len = static_cast<cl_uint>(wallet.size());
-    cl_uint nonce_len = static_cast<cl_uint>(nonce.size());
-    clSetKernelArg(ctx.verify_kernel, 0, sizeof(cl_mem), &ctx.weights_buf);
-    clSetKernelArg(ctx.verify_kernel, 1, sizeof(cl_mem), &wallet_buf);
-    clSetKernelArg(ctx.verify_kernel, 2, sizeof(cl_uint), &wallet_len);
-    clSetKernelArg(ctx.verify_kernel, 3, sizeof(cl_mem), &nonce_buf);
-    clSetKernelArg(ctx.verify_kernel, 4, sizeof(cl_uint), &nonce_len);
-    clSetKernelArg(ctx.verify_kernel, 5, sizeof(cl_mem), &score_buf);
-    clSetKernelArg(ctx.verify_kernel, 6, sizeof(cl_mem), &digest_buf);
-
-    // Launch single work-item
-    size_t global_size = 1;
-    err = clEnqueueNDRangeKernel(ctx.queue, ctx.verify_kernel, 1, nullptr, &global_size, nullptr, 0, nullptr, nullptr);
-    if (err != CL_SUCCESS) {
-        std::cerr << "Failed to launch verify kernel: " << err << std::endl;
-        clReleaseMemObject(wallet_buf);
-        clReleaseMemObject(nonce_buf);
-        clReleaseMemObject(score_buf);
-        clReleaseMemObject(digest_buf);
-        return false;
-    }
-
-    // Read results
-    result.digest.resize(DIGEST_BYTES);
-    clEnqueueReadBuffer(ctx.queue, score_buf, CL_TRUE, 0, sizeof(cl_ulong), &result.score, 0, nullptr, nullptr);
-    clEnqueueReadBuffer(ctx.queue, digest_buf, CL_TRUE, 0, DIGEST_BYTES, result.digest.data(), 0, nullptr, nullptr);
-    result.bits = count_leading_zero_bits(result.digest.data(), DIGEST_BYTES);
-
-    clReleaseMemObject(wallet_buf);
-    clReleaseMemObject(nonce_buf);
-    clReleaseMemObject(score_buf);
-    clReleaseMemObject(digest_buf);
-
-    return true;
-}
-
 bool create_gpu_context(cl_device_id device, int device_index, GPUContext& ctx) {
     ctx.device_index = device_index;
     ctx.device = device;
@@ -300,12 +240,6 @@ bool create_gpu_context(cl_device_id device, int device_index, GPUContext& ctx) 
     ctx.mine_kernel = clCreateKernel(ctx.program, "neural_pow_mine", &err);
     if (err != CL_SUCCESS) {
         std::cerr << "[GPU " << device_index << "] Failed to create mine kernel: " << err << std::endl;
-        return false;
-    }
-
-    ctx.verify_kernel = clCreateKernel(ctx.program, "neural_pow_verify", &err);
-    if (err != CL_SUCCESS) {
-        std::cerr << "[GPU " << device_index << "] Failed to create verify kernel: " << err << std::endl;
         return false;
     }
 
@@ -492,7 +426,6 @@ void signal_handler(int) {
 
 int main(int argc, char* argv[]) {
     std::string username = DEFAULT_USERNAME;
-    std::string verify_proof;
     int target_zero_bits = 16;
     bool verbose = false;
 
@@ -500,7 +433,16 @@ int main(int argc, char* argv[]) {
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
 
-        if ((arg == "--user" || arg == "-u") && i + 1 < argc) {
+        if (arg == "--help" || arg == "-h") {
+            std::cout << "Usage: " << argv[0] << " [OPTIONS]\n"
+                      << "Options:\n"
+                      << "  -u, --user STRING   Username (default: " << DEFAULT_USERNAME << ")\n"
+                      << "  -b, --bits N        Target leading zero bits (default: 16)\n"
+                      << "  -x, --hex N         Target leading zero hex digits (N*4 bits)\n"
+                      << "  -v, --verbose       Show network outputs\n"
+                      << "  -h, --help          Show this help\n";
+            return 0;
+        } else if ((arg == "--user" || arg == "-u") && i + 1 < argc) {
             username = argv[++i];
         } else if (arg.rfind("--user=", 0) == 0) {
             username = arg.substr(7);
@@ -514,17 +456,13 @@ int main(int argc, char* argv[]) {
             target_zero_bits = std::max(std::stoi(arg.substr(6)) * 4, 1);
         } else if (arg == "--verbose" || arg == "-v") {
             verbose = true;
-        } else if ((arg == "--verify" || arg == "-V") && i + 1 < argc) {
-            verify_proof = argv[++i];
-        } else if (arg.rfind("--verify=", 0) == 0) {
-            verify_proof = arg.substr(9);
-        } else if (arg[0] != '-') {
-            if (username == DEFAULT_USERNAME) username = arg;
-            else target_zero_bits = std::max(std::stoi(arg), 1);
+        } else {
+            std::cerr << "Unknown option: " << arg << "\nUse --help for usage.\n";
+            return 1;
         }
     }
 
-    // Discover GPUs first (needed for both verify and mining)
+    // Discover GPUs
     std::vector<cl_device_id> devices = discover_all_gpus();
     if (devices.empty()) {
         std::cerr << "No GPUs found!" << std::endl;
@@ -550,35 +488,6 @@ int main(int argc, char* argv[]) {
 
     // Setup weights buffer for first GPU
     setup_weights_buffer(*gpus[0], weights);
-
-    // Verify mode
-    if (!verify_proof.empty()) {
-        size_t slash_pos = verify_proof.find('/');
-        if (slash_pos == std::string::npos) {
-            std::cerr << "Invalid proof format. Expected: username/nonce" << std::endl;
-            return 1;
-        }
-        std::string proof_username = verify_proof.substr(0, slash_pos);
-        std::string nonce_str = verify_proof.substr(slash_pos + 1);
-
-        std::vector<uint8_t> nonce(nonce_str.begin(), nonce_str.end());
-
-        VerifyResult vr;
-        if (!verify_nonce_gpu(*gpus[0], proof_username, nonce, vr)) {
-            std::cerr << "Verification failed" << std::endl;
-            return 1;
-        }
-
-        std::string digest_hex = bytes_to_hex(vr.digest.data(), DIGEST_BYTES);
-
-        std::cout << "Proof Verification" << std::endl;
-        std::cout << "==================" << std::endl;
-        std::cout << "Username: " << proof_username << std::endl;
-        std::cout << "Nonce: " << nonce_str << " (" << nonce_str.size() << " bytes)" << std::endl;
-        std::cout << "Digest: " << format_digest_with_marker(digest_hex, vr.bits) << std::endl;
-        std::cout << "Result: " << vr.bits << " bits" << std::endl;
-        return 0;
-    }
 
     // Mining mode
     int base_bits = std::max(target_zero_bits - 1, 0);
