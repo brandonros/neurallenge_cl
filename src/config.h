@@ -16,6 +16,9 @@
 // 16 bytes = 22 base64 chars, provides plenty of entropy
 #define NONCE_BYTES 16
 
+// Max wallet/username length for proof binding
+#define WALLET_MAX_BYTES 32
+
 // Serialized output size for hashing
 #define SERIALIZED_OUTPUT_BYTES (OUTPUT_DIM * 4)
 

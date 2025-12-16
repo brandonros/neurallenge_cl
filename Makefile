@@ -38,10 +38,10 @@ endif
 CFLAGS=-c -std=c++17 -Wall -O3 -march=native -pthread -ffp-contract=off -fno-fast-math -frounding-math
 
 # Executables
-MINER=$(OUTDIR)/neurallenge
-SERVER=$(OUTDIR)/neurallenge-server
+MINER=$(OUTDIR)/miner
+SERVER=$(OUTDIR)/server
 
-all: $(OUTDIR) $(MINER)
+all: $(OUTDIR) $(MINER) $(SERVER)
 
 miner: $(MINER)
 

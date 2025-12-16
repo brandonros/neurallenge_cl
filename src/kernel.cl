@@ -271,24 +271,29 @@ inline void sha256_short(const uchar* data, uint len, uchar* out) {
     }
 }
 
-// Expand nonce to 64 bytes using SHA-256
-// expanded = SHA256(nonce || 0x00) || SHA256(nonce || 0x01)
-inline void expand_nonce(const uchar* nonce, uint nonce_len, uchar* expanded) {
-    uchar buf[NONCE_BYTES + 1];
+// Expand wallet||nonce to 64 bytes using SHA-256
+// expanded = SHA256(wallet || nonce || 0x00) || SHA256(wallet || nonce || 0x01)
+inline void expand_wallet_nonce(const uchar* wallet, uint wallet_len,
+                                 const uchar* nonce, uint nonce_len, uchar* expanded) {
+    uchar buf[WALLET_MAX_BYTES + NONCE_BYTES + 1];
+    uint total_len = wallet_len + nonce_len;
 
-    // Copy nonce and append suffix byte
-    #pragma unroll
-    for (uint i = 0; i < NONCE_BYTES; i++) {
-        buf[i] = nonce[i];
+    // Copy wallet
+    for (uint i = 0; i < wallet_len; i++) {
+        buf[i] = wallet[i];
+    }
+    // Copy nonce
+    for (uint i = 0; i < nonce_len; i++) {
+        buf[wallet_len + i] = nonce[i];
     }
 
-    // First half: SHA256(nonce || 0x00)
-    buf[nonce_len] = 0x00;
-    sha256_short(buf, nonce_len + 1, expanded);
+    // First half: SHA256(wallet || nonce || 0x00)
+    buf[total_len] = 0x00;
+    sha256_short(buf, total_len + 1, expanded);
 
-    // Second half: SHA256(nonce || 0x01)
-    buf[nonce_len] = 0x01;
-    sha256_short(buf, nonce_len + 1, expanded + 32);
+    // Second half: SHA256(wallet || nonce || 0x01)
+    buf[total_len] = 0x01;
+    sha256_short(buf, total_len + 1, expanded + 32);
 }
 
 // ============================================================================
@@ -305,10 +310,11 @@ inline void expanded_to_input(const uchar* expanded, float* input) {
     }
 }
 
-// Full nonce-to-input: any nonce -> SHA256 expand -> 32 floats
-inline void nonce_to_input(const uchar* nonce, uint nonce_len, float* input) {
+// Full wallet+nonce-to-input: wallet || nonce -> SHA256 expand -> 32 floats
+inline void wallet_nonce_to_input(const uchar* wallet, uint wallet_len,
+                                   const uchar* nonce, uint nonce_len, float* input) {
     uchar expanded[64];
-    expand_nonce(nonce, nonce_len, expanded);
+    expand_wallet_nonce(wallet, wallet_len, nonce, nonce_len, expanded);
     expanded_to_input(expanded, input);
 }
 
@@ -515,6 +521,8 @@ inline ulong compute_score(const float* output, uint dim) {
 
 __kernel void neural_pow_mine(
     __global const char* weights,
+    __global const uchar* wallet,    // Wallet/username for proof binding
+    uint wallet_len,
     ulong target_score,              // First 8 bytes of best digest (lower = better)
     uint seed_lo,
     uint seed_hi,
@@ -523,6 +531,12 @@ __kernel void neural_pow_mine(
     __global uchar* found_digests    // Full DIGEST_BYTES digest for each result
 ) {
     uint thread_idx = (uint)get_global_id(0);
+
+    // Copy wallet to private memory
+    uchar priv_wallet[WALLET_MAX_BYTES];
+    for (uint i = 0; i < wallet_len && i < WALLET_MAX_BYTES; i++) {
+        priv_wallet[i] = wallet[i];
+    }
 
     // Initialize RNG
     uint s0, s1;
@@ -540,8 +554,8 @@ __kernel void neural_pow_mine(
         // Generate random nonce
         generate_nonce(&s0, &s1, nonce);
 
-        // Convert nonce to input (hash expansion)
-        nonce_to_input(nonce, NONCE_BYTES, input);
+        // Convert wallet||nonce to input (hash expansion)
+        wallet_nonce_to_input(priv_wallet, wallet_len, nonce, NONCE_BYTES, input);
 
         // Forward pass
         // Layer 1: 32 -> 256, ReLU
@@ -599,19 +613,27 @@ __kernel void neural_pow_mine(
 }
 
 // ============================================================================
-// Verification Kernel - Single nonce verification
+// Verification Kernel - Single wallet+nonce verification
 // ============================================================================
 
 __kernel void neural_pow_verify(
     __global const char* weights,
+    __global const uchar* in_wallet,
+    uint wallet_len,
     __global const uchar* in_nonce,
     uint nonce_len,
     __global ulong* out_score,
     __global uchar* out_digest
 ) {
+    // Copy wallet to private memory
+    uchar wallet[WALLET_MAX_BYTES];
+    for (uint i = 0; i < wallet_len && i < WALLET_MAX_BYTES; i++) {
+        wallet[i] = in_wallet[i];
+    }
+
     // Copy nonce to private memory
-    uchar nonce[64];  // Max nonce length
-    for (uint i = 0; i < nonce_len && i < 64; i++) {
+    uchar nonce[NONCE_BYTES];
+    for (uint i = 0; i < nonce_len && i < NONCE_BYTES; i++) {
         nonce[i] = in_nonce[i];
     }
 
@@ -622,8 +644,8 @@ __kernel void neural_pow_verify(
     float hidden3[HIDDEN_DIM];
     float output[OUTPUT_DIM];
 
-    // Convert nonce to input
-    nonce_to_input(nonce, nonce_len, input);
+    // Convert wallet||nonce to input
+    wallet_nonce_to_input(wallet, wallet_len, nonce, nonce_len, input);
 
     // Forward pass
     layer_forward(weights + W1_OFFSET, weights + B1_OFFSET, input, hidden1, INPUT_DIM, HIDDEN_DIM, 1);

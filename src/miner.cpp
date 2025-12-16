@@ -110,6 +110,8 @@ struct GPUContext {
     cl_kernel mine_kernel;
     cl_kernel verify_kernel;
     cl_mem weights_buf;
+    cl_mem wallet_buf;
+    cl_uint wallet_len;
 
     ResultBuffer buffers[2];
     int current_buffer;
@@ -198,10 +200,12 @@ struct VerifyResult {
     int bits;
 };
 
-bool verify_nonce_gpu(GPUContext& ctx, const std::vector<uint8_t>& nonce, VerifyResult& result) {
+bool verify_nonce_gpu(GPUContext& ctx, const std::string& wallet, const std::vector<uint8_t>& nonce, VerifyResult& result) {
     cl_int err;
 
     // Create buffers
+    cl_mem wallet_buf = clCreateBuffer(ctx.context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                        wallet.size(), (void*)wallet.data(), &err);
     cl_mem nonce_buf = clCreateBuffer(ctx.context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
                                        nonce.size(), (void*)nonce.data(), &err);
     cl_mem score_buf = clCreateBuffer(ctx.context, CL_MEM_WRITE_ONLY, sizeof(cl_ulong), nullptr, &err);
@@ -211,19 +215,23 @@ bool verify_nonce_gpu(GPUContext& ctx, const std::vector<uint8_t>& nonce, Verify
         return false;
     }
 
-    // Set args
+    // Set args: weights, wallet, wallet_len, nonce, nonce_len, score, digest
+    cl_uint wallet_len = static_cast<cl_uint>(wallet.size());
     cl_uint nonce_len = static_cast<cl_uint>(nonce.size());
     clSetKernelArg(ctx.verify_kernel, 0, sizeof(cl_mem), &ctx.weights_buf);
-    clSetKernelArg(ctx.verify_kernel, 1, sizeof(cl_mem), &nonce_buf);
-    clSetKernelArg(ctx.verify_kernel, 2, sizeof(cl_uint), &nonce_len);
-    clSetKernelArg(ctx.verify_kernel, 3, sizeof(cl_mem), &score_buf);
-    clSetKernelArg(ctx.verify_kernel, 4, sizeof(cl_mem), &digest_buf);
+    clSetKernelArg(ctx.verify_kernel, 1, sizeof(cl_mem), &wallet_buf);
+    clSetKernelArg(ctx.verify_kernel, 2, sizeof(cl_uint), &wallet_len);
+    clSetKernelArg(ctx.verify_kernel, 3, sizeof(cl_mem), &nonce_buf);
+    clSetKernelArg(ctx.verify_kernel, 4, sizeof(cl_uint), &nonce_len);
+    clSetKernelArg(ctx.verify_kernel, 5, sizeof(cl_mem), &score_buf);
+    clSetKernelArg(ctx.verify_kernel, 6, sizeof(cl_mem), &digest_buf);
 
     // Launch single work-item
     size_t global_size = 1;
     err = clEnqueueNDRangeKernel(ctx.queue, ctx.verify_kernel, 1, nullptr, &global_size, nullptr, 0, nullptr, nullptr);
     if (err != CL_SUCCESS) {
         std::cerr << "Failed to launch verify kernel: " << err << std::endl;
+        clReleaseMemObject(wallet_buf);
         clReleaseMemObject(nonce_buf);
         clReleaseMemObject(score_buf);
         clReleaseMemObject(digest_buf);
@@ -236,6 +244,7 @@ bool verify_nonce_gpu(GPUContext& ctx, const std::vector<uint8_t>& nonce, Verify
     clEnqueueReadBuffer(ctx.queue, digest_buf, CL_TRUE, 0, DIGEST_BYTES, result.digest.data(), 0, nullptr, nullptr);
     result.bits = count_leading_zero_bits(result.digest.data(), DIGEST_BYTES);
 
+    clReleaseMemObject(wallet_buf);
     clReleaseMemObject(nonce_buf);
     clReleaseMemObject(score_buf);
     clReleaseMemObject(digest_buf);
@@ -317,7 +326,20 @@ void setup_weights_buffer(GPUContext& ctx, const std::vector<int8_t>& weights) {
     cl_int err;
     ctx.weights_buf = clCreateBuffer(ctx.context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
                                       weights.size(), (void*)weights.data(), &err);
+}
+
+void setup_mining_args(GPUContext& ctx, const std::string& wallet) {
+    cl_int err;
+
+    // Wallet buffer (for proof binding)
+    ctx.wallet_len = static_cast<cl_uint>(std::min(wallet.size(), static_cast<size_t>(WALLET_MAX_BYTES)));
+    ctx.wallet_buf = clCreateBuffer(ctx.context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                     ctx.wallet_len, (void*)wallet.data(), &err);
+
+    // Set static kernel args (weights, wallet, wallet_len)
     clSetKernelArg(ctx.mine_kernel, 0, sizeof(cl_mem), &ctx.weights_buf);
+    clSetKernelArg(ctx.mine_kernel, 1, sizeof(cl_mem), &ctx.wallet_buf);
+    clSetKernelArg(ctx.mine_kernel, 2, sizeof(cl_uint), &ctx.wallet_len);
 }
 
 // ============================================================================
@@ -426,12 +448,13 @@ void gpu_worker_thread(GPUContext& ctx, SharedState& shared) {
         cl_uint zero = 0;
         clEnqueueWriteBuffer(ctx.queue, buf.found_count_buf, CL_FALSE, 0, sizeof(cl_uint), &zero, 0, nullptr, nullptr);
 
-        clSetKernelArg(ctx.mine_kernel, 1, sizeof(cl_ulong), &target_score);
-        clSetKernelArg(ctx.mine_kernel, 2, sizeof(cl_uint), &seed_lo);
-        clSetKernelArg(ctx.mine_kernel, 3, sizeof(cl_uint), &seed_hi);
-        clSetKernelArg(ctx.mine_kernel, 4, sizeof(cl_mem), &buf.found_count_buf);
-        clSetKernelArg(ctx.mine_kernel, 5, sizeof(cl_mem), &buf.found_nonces_buf);
-        clSetKernelArg(ctx.mine_kernel, 6, sizeof(cl_mem), &buf.found_digests_buf);
+        // Args 0-2 (weights, wallet, wallet_len) set in setup_static_buffers
+        clSetKernelArg(ctx.mine_kernel, 3, sizeof(cl_ulong), &target_score);
+        clSetKernelArg(ctx.mine_kernel, 4, sizeof(cl_uint), &seed_lo);
+        clSetKernelArg(ctx.mine_kernel, 5, sizeof(cl_uint), &seed_hi);
+        clSetKernelArg(ctx.mine_kernel, 6, sizeof(cl_mem), &buf.found_count_buf);
+        clSetKernelArg(ctx.mine_kernel, 7, sizeof(cl_mem), &buf.found_nonces_buf);
+        clSetKernelArg(ctx.mine_kernel, 8, sizeof(cl_mem), &buf.found_digests_buf);
 
         cl_int err = clEnqueueNDRangeKernel(ctx.queue, ctx.mine_kernel, 1, nullptr, &global_size, &local_size, 0, nullptr, &buf.kernel_done);
         if (err != CL_SUCCESS) {
@@ -541,7 +564,7 @@ int main(int argc, char* argv[]) {
         std::vector<uint8_t> nonce(nonce_str.begin(), nonce_str.end());
 
         VerifyResult vr;
-        if (!verify_nonce_gpu(*gpus[0], nonce, vr)) {
+        if (!verify_nonce_gpu(*gpus[0], proof_username, nonce, vr)) {
             std::cerr << "Verification failed" << std::endl;
             return 1;
         }
@@ -567,6 +590,9 @@ int main(int argc, char* argv[]) {
     shared.best_score = initial_target;
     shared.start_time = std::chrono::steady_clock::now();
 
+    // Setup mining args for first GPU (wallet for proof binding)
+    setup_mining_args(*gpus[0], username);
+
     std::cout << "Neural Proof-of-Work Miner (OpenCL)" << std::endl;
     std::cout << "Username: " << shared.username << std::endl;
     std::cout << "Target: " << target_zero_bits << "+ leading zero bits" << std::endl;
@@ -584,6 +610,7 @@ int main(int argc, char* argv[]) {
             return 1;
         }
         setup_weights_buffer(*gpus[i], weights);
+        setup_mining_args(*gpus[i], username);
     }
 
     for (auto& gpu : gpus) {

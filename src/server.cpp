@@ -117,7 +117,8 @@ bool init_opencl(OpenCLContext& cl) {
     cl.program = clCreateProgramWithSource(cl.context, 1, &src, &srcLen, &err);
     if (err != CL_SUCCESS) return false;
 
-    err = clBuildProgram(cl.program, 1, &cl.device, "-cl-fp32-correctly-rounded-divide-sqrt", nullptr, nullptr);
+    // HASHES_PER_THREAD needed for mining kernel (even though server doesn't use it)
+    err = clBuildProgram(cl.program, 1, &cl.device, "-D HASHES_PER_THREAD=1 -cl-fp32-correctly-rounded-divide-sqrt", nullptr, nullptr);
     if (err != CL_SUCCESS) {
         char log[16384];
         clGetProgramBuildInfo(cl.program, cl.device, CL_PROGRAM_BUILD_LOG, sizeof(log), log, nullptr);
@@ -181,25 +182,32 @@ struct VerifyResult {
     int bits;
 };
 
-bool verify_nonce_gpu(OpenCLContext& cl, const std::vector<uint8_t>& nonce, VerifyResult& result) {
+bool verify_nonce_gpu(OpenCLContext& cl, const std::string& wallet, const std::vector<uint8_t>& nonce, VerifyResult& result) {
     cl_int err;
 
+    cl_mem wallet_buf = clCreateBuffer(cl.context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                        wallet.size(), (void*)wallet.data(), &err);
     cl_mem nonce_buf = clCreateBuffer(cl.context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
                                        nonce.size(), (void*)nonce.data(), &err);
     cl_mem score_buf = clCreateBuffer(cl.context, CL_MEM_WRITE_ONLY, sizeof(cl_ulong), nullptr, &err);
     cl_mem digest_buf = clCreateBuffer(cl.context, CL_MEM_WRITE_ONLY, DIGEST_BYTES, nullptr, &err);
     if (err != CL_SUCCESS) return false;
 
+    // Set args: weights, wallet, wallet_len, nonce, nonce_len, score, digest
+    cl_uint wallet_len = static_cast<cl_uint>(wallet.size());
     cl_uint nonce_len = static_cast<cl_uint>(nonce.size());
     clSetKernelArg(cl.verify_kernel, 0, sizeof(cl_mem), &cl.weights_buf);
-    clSetKernelArg(cl.verify_kernel, 1, sizeof(cl_mem), &nonce_buf);
-    clSetKernelArg(cl.verify_kernel, 2, sizeof(cl_uint), &nonce_len);
-    clSetKernelArg(cl.verify_kernel, 3, sizeof(cl_mem), &score_buf);
-    clSetKernelArg(cl.verify_kernel, 4, sizeof(cl_mem), &digest_buf);
+    clSetKernelArg(cl.verify_kernel, 1, sizeof(cl_mem), &wallet_buf);
+    clSetKernelArg(cl.verify_kernel, 2, sizeof(cl_uint), &wallet_len);
+    clSetKernelArg(cl.verify_kernel, 3, sizeof(cl_mem), &nonce_buf);
+    clSetKernelArg(cl.verify_kernel, 4, sizeof(cl_uint), &nonce_len);
+    clSetKernelArg(cl.verify_kernel, 5, sizeof(cl_mem), &score_buf);
+    clSetKernelArg(cl.verify_kernel, 6, sizeof(cl_mem), &digest_buf);
 
     size_t global_size = 1;
     err = clEnqueueNDRangeKernel(cl.queue, cl.verify_kernel, 1, nullptr, &global_size, nullptr, 0, nullptr, nullptr);
     if (err != CL_SUCCESS) {
+        clReleaseMemObject(wallet_buf);
         clReleaseMemObject(nonce_buf);
         clReleaseMemObject(score_buf);
         clReleaseMemObject(digest_buf);
@@ -211,6 +219,7 @@ bool verify_nonce_gpu(OpenCLContext& cl, const std::vector<uint8_t>& nonce, Veri
     clEnqueueReadBuffer(cl.queue, digest_buf, CL_TRUE, 0, DIGEST_BYTES, result.digest.data(), 0, nullptr, nullptr);
     result.bits = count_leading_zero_bits(result.digest.data(), DIGEST_BYTES);
 
+    clReleaseMemObject(wallet_buf);
     clReleaseMemObject(nonce_buf);
     clReleaseMemObject(score_buf);
     clReleaseMemObject(digest_buf);
@@ -328,7 +337,7 @@ int main(int argc, char* argv[]) {
 
             {
                 std::lock_guard<std::mutex> lock(state.mutex);
-                if (!verify_nonce_gpu(state.cl, nonce, vr)) {
+                if (!verify_nonce_gpu(state.cl, wallet, nonce, vr)) {
                     response["error"] = "verification failed";
                     state.total_rejected++;
                     res.status = 500;
