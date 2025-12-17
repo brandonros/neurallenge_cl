@@ -200,18 +200,18 @@ bool init_opencl(OpenCLContext& cl) {
     cl.device = nullptr;
     for (cl_platform_id platform : platforms) {
         cl_uint num_devices;
-        if (clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, 1, &cl.device, &num_devices) == CL_SUCCESS && num_devices > 0) {
+        if (clGetDeviceIDs(platform, CL_DEVICE_TYPE_CPU, 1, &cl.device, &num_devices) == CL_SUCCESS && num_devices > 0) {
             break;
         }
     }
     if (!cl.device) {
-        std::cerr << "No GPU found" << std::endl;
+        std::cerr << "No OpenCL CPU device found" << std::endl;
         return false;
     }
 
     char name[256];
     clGetDeviceInfo(cl.device, CL_DEVICE_NAME, sizeof(name), name, nullptr);
-    std::cout << "Using GPU: " << name << std::endl;
+    std::cout << "Using CPU: " << name << std::endl;
 
     cl.context = clCreateContext(nullptr, 1, &cl.device, nullptr, nullptr, &err);
     if (err != CL_SUCCESS) return false;

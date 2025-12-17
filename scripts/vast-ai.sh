@@ -16,7 +16,7 @@ ssh -p $SSH_PORT $SSH_USERNAME@$SSH_HOST << EOF
 killall miner
 
 # install dependencies
-apt-get install -y xxd
+apt install -y xxd opencl-headers ocl-icd-opencl-dev pocl-opencl-icd libsqlite3-dev
 
 # build project
 cd /workspace/neurallenge_cl
