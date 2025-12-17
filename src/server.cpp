@@ -438,7 +438,7 @@ json get_proofs_paginated(sqlite3* db, int limit, int offset) {
     json arr = json::array();
 
     sqlite3_stmt* stmt;
-    const char* sql = "SELECT timestamp, wallet, nonce, bits, reward, digest FROM proofs ORDER BY bits DESC LIMIT ? OFFSET ?";
+    const char* sql = "SELECT timestamp, wallet, nonce, bits, reward, digest FROM proofs ORDER BY digest ASC LIMIT ? OFFSET ?";
 
     if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
         return arr;
