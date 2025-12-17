@@ -135,7 +135,7 @@ using json = nlohmann::json;
 //
 // ============================================================================
 
-constexpr int MIN_BITS = 32;
+constexpr int MIN_BITS = 20;
 constexpr int SERVER_PORT = 8080;
 constexpr const char* DB_FILE = "proofs.db";
 constexpr const char* WEIGHT_EPOCH = "epoch0";

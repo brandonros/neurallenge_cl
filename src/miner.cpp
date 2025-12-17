@@ -17,11 +17,18 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <queue>
 #include <random>
 #include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
+#include <condition_variable>
+
+#include "httplib.h"
+#include "json.hpp"
+
+using json = nlohmann::json;
 
 #ifndef DEFAULT_USERNAME
 #define DEFAULT_USERNAME "anonymous"
@@ -77,15 +84,33 @@ std::string format_digest_with_marker(const std::string& hex, int lz_bits) {
 // Shared State
 // ============================================================================
 
+// Submission queue entry
+struct SubmitEntry {
+    std::string wallet;
+    std::string nonce;
+    int bits;
+    std::string digest_hex;
+};
+
 struct SharedState {
     std::mutex best_mutex;
     uint64_t best_score;
+    uint64_t fixed_threshold;  // Fixed threshold for "collect all" mode
     std::vector<uint8_t> best_nonce;
     std::vector<uint8_t> best_digest;
     std::atomic<bool> running{true};
     std::string username;
     bool verbose = false;
     std::chrono::steady_clock::time_point start_time;
+
+    // Submission queue
+    std::string server_url;
+    std::mutex submit_mutex;
+    std::condition_variable submit_cv;
+    std::queue<SubmitEntry> submit_queue;
+    std::atomic<uint64_t> submitted{0};
+    std::atomic<uint64_t> accepted{0};
+    std::atomic<uint64_t> rejected{0};
 };
 
 // ============================================================================
@@ -306,45 +331,126 @@ void process_kernel_results(GPUContext& ctx, SharedState& shared, ResultBuffer& 
         clEnqueueReadBuffer(ctx.queue, buf.found_digests_buf, CL_TRUE, 0,
                            results_to_read * DIGEST_BYTES, all_digests.data(), 0, nullptr, nullptr);
 
-        // Find best in batch (extract score from digest)
-        size_t best_idx = 0;
-        uint64_t best_score = digest_to_score(all_digests.data());
-        for (size_t i = 1; i < results_to_read; i++) {
-            uint64_t score = digest_to_score(all_digests.data() + i * DIGEST_BYTES);
-            if (score < best_score) {
-                best_score = score;
-                best_idx = i;
-            }
-        }
-
-        uint8_t* batch_best_nonce = all_nonces.data() + best_idx * NONCE_BYTES;
-        uint8_t* batch_best_digest = all_digests.data() + best_idx * DIGEST_BYTES;
-
-        // Trust GPU results directly - digest already computed by mining kernel
+        // Output ALL results that meet threshold and queue for submission
         {
             std::lock_guard<std::mutex> lock(shared.best_mutex);
-            if (best_score < shared.best_score) {
-                int bits = count_leading_zero_bits(batch_best_digest, DIGEST_BYTES);
-                std::string digest_hex = bytes_to_hex(batch_best_digest, DIGEST_BYTES);
-                std::string nonce_str(reinterpret_cast<char*>(batch_best_nonce), NONCE_BYTES);
+            for (size_t i = 0; i < results_to_read; i++) {
+                uint8_t* nonce = all_nonces.data() + i * NONCE_BYTES;
+                uint8_t* digest = all_digests.data() + i * DIGEST_BYTES;
+                uint64_t score = digest_to_score(digest);
 
-                shared.best_score = best_score;
-                shared.best_nonce.assign(batch_best_nonce, batch_best_nonce + NONCE_BYTES);
-                shared.best_digest.assign(batch_best_digest, batch_best_digest + DIGEST_BYTES);
+                int bits = count_leading_zero_bits(digest, DIGEST_BYTES);
+                std::string digest_hex = bytes_to_hex(digest, DIGEST_BYTES);
+                std::string nonce_str(reinterpret_cast<char*>(nonce), NONCE_BYTES);
+
                 ctx.matches_found.fetch_add(1);
 
-                auto now = std::chrono::steady_clock::now();
-                auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - shared.start_time).count();
+                // Track best for final summary
+                if (score < shared.best_score) {
+                    shared.best_score = score;
+                    shared.best_nonce.assign(nonce, nonce + NONCE_BYTES);
+                    shared.best_digest.assign(digest, digest + DIGEST_BYTES);
+                }
 
-                std::cout << "\n[GPU " << ctx.device_index << "] NEW BEST: "
-                          << bits << " bits | digest="
-                          << format_digest_with_marker(digest_hex, bits) << std::endl;
-                std::cout << "  Proof: " << shared.username << "/" << nonce_str << std::endl;
-                std::cout << "  Time: " << elapsed << "s | Batch had " << found_count << " candidates" << std::endl;
-                std::cout << std::endl;
+                // Output this result
+                std::cout << "\n[GPU " << ctx.device_index << "] FOUND: "
+                          << bits << " bits | " << shared.username << "/" << nonce_str
+                          << " | " << format_digest_with_marker(digest_hex, bits) << std::endl;
+
+                // Queue for submission
+                {
+                    std::lock_guard<std::mutex> submit_lock(shared.submit_mutex);
+                    shared.submit_queue.push({shared.username, nonce_str, bits, digest_hex});
+                    shared.submit_cv.notify_one();
+                }
             }
         }
+
+        if (found_count > MAX_RESULTS) {
+            std::cout << "  (batch had " << found_count << " results, showing first " << MAX_RESULTS << ")" << std::endl;
+        }
     }
+}
+
+// ============================================================================
+// Submission Worker Thread
+// ============================================================================
+
+void submit_worker_thread(SharedState& shared) {
+    std::cout << "[Submit] Submitting proofs to " << shared.server_url << std::endl;
+
+    httplib::Client cli(shared.server_url);
+    cli.set_connection_timeout(5);
+    cli.set_read_timeout(10);
+
+    while (shared.running.load()) {
+        SubmitEntry entry;
+
+        // Wait for work
+        {
+            std::unique_lock<std::mutex> lock(shared.submit_mutex);
+            shared.submit_cv.wait_for(lock, std::chrono::milliseconds(100), [&] {
+                return !shared.submit_queue.empty() || !shared.running.load();
+            });
+
+            if (!shared.running.load() && shared.submit_queue.empty()) break;
+            if (shared.submit_queue.empty()) continue;
+
+            entry = std::move(shared.submit_queue.front());
+            shared.submit_queue.pop();
+        }
+
+        // Submit to server
+        json payload;
+        payload["wallet"] = entry.wallet;
+        payload["nonce"] = entry.nonce;
+
+        shared.submitted.fetch_add(1);
+
+        auto res = cli.Post("/submit", payload.dump(), "application/json");
+
+        if (res && res->status == 200) {
+            try {
+                json resp = json::parse(res->body);
+                if (resp.contains("success") && resp["success"].get<bool>()) {
+                    shared.accepted.fetch_add(1);
+                    double reward = resp.value("reward", 0.0);
+                    std::cout << "\n[Submit] ACCEPTED: " << entry.bits << " bits | reward="
+                              << std::fixed << std::setprecision(2) << reward << std::endl;
+                } else {
+                    shared.rejected.fetch_add(1);
+                    std::string err = resp.value("error", "unknown");
+                    std::cout << "\n[Submit] REJECTED: " << entry.bits << " bits | " << err << std::endl;
+                }
+            } catch (...) {
+                shared.rejected.fetch_add(1);
+                std::cout << "\n[Submit] REJECTED: " << entry.bits << " bits | parse error" << std::endl;
+            }
+        } else {
+            shared.rejected.fetch_add(1);
+            std::string err = res ? std::to_string(res->status) : "connection failed";
+            std::cout << "\n[Submit] FAILED: " << entry.bits << " bits | " << err << std::endl;
+        }
+    }
+
+    // Drain remaining queue
+    std::lock_guard<std::mutex> lock(shared.submit_mutex);
+    while (!shared.submit_queue.empty()) {
+        auto& entry = shared.submit_queue.front();
+        json payload;
+        payload["wallet"] = entry.wallet;
+        payload["nonce"] = entry.nonce;
+
+        auto res = cli.Post("/submit", payload.dump(), "application/json");
+        if (res && res->status == 200) {
+            shared.accepted.fetch_add(1);
+        } else {
+            shared.rejected.fetch_add(1);
+        }
+        shared.submit_queue.pop();
+    }
+
+    std::cout << "[Submit] Worker stopped" << std::endl;
 }
 
 void gpu_worker_thread(GPUContext& ctx, SharedState& shared) {
@@ -369,11 +475,9 @@ void gpu_worker_thread(GPUContext& ctx, SharedState& shared) {
 
         if (!shared.running.load()) break;
 
-        cl_ulong target_score;
-        {
-            std::lock_guard<std::mutex> lock(shared.best_mutex);
-            target_score = shared.best_score;
-        }
+        // Use FIXED threshold - don't tighten over time
+        // This gives us ALL results >= target bits
+        cl_ulong target_score = shared.fixed_threshold;
 
         ctx.launch_counter.fetch_add(1);
         cl_uint seed_lo = rng();
@@ -426,6 +530,7 @@ void signal_handler(int) {
 
 int main(int argc, char* argv[]) {
     std::string username = DEFAULT_USERNAME;
+    std::string server_url = "http://localhost:8080";
     int target_zero_bits = 16;
     bool verbose = false;
 
@@ -437,6 +542,7 @@ int main(int argc, char* argv[]) {
             std::cout << "Usage: " << argv[0] << " [OPTIONS]\n"
                       << "Options:\n"
                       << "  -u, --user STRING   Username (default: " << DEFAULT_USERNAME << ")\n"
+                      << "  -s, --server URL    Server URL for proof submission (default: http://localhost:8080)\n"
                       << "  -b, --bits N        Target leading zero bits (default: 16)\n"
                       << "  -x, --hex N         Target leading zero hex digits (N*4 bits)\n"
                       << "  -v, --verbose       Show network outputs\n"
@@ -446,6 +552,10 @@ int main(int argc, char* argv[]) {
             username = argv[++i];
         } else if (arg.rfind("--user=", 0) == 0) {
             username = arg.substr(7);
+        } else if ((arg == "--server" || arg == "-s") && i + 1 < argc) {
+            server_url = argv[++i];
+        } else if (arg.rfind("--server=", 0) == 0) {
+            server_url = arg.substr(9);
         } else if ((arg == "--bits" || arg == "-b") && i + 1 < argc) {
             target_zero_bits = std::max(std::stoi(argv[++i]), 1);
         } else if (arg.rfind("--bits=", 0) == 0) {
@@ -489,19 +599,21 @@ int main(int argc, char* argv[]) {
     // Setup weights buffer for first GPU
     setup_weights_buffer(*gpus[0], weights);
 
-    // Mining mode
-    int base_bits = std::max(target_zero_bits - 1, 0);
-    uint64_t initial_target = (base_bits >= 64) ? 0 : (1ULL << (64 - base_bits));
+    // Mining mode - fixed threshold to collect ALL results >= target bits
+    uint64_t fixed_threshold = (target_zero_bits >= 64) ? 0 : (1ULL << (64 - target_zero_bits));
 
     SharedState shared;
     shared.username = username;
+    shared.server_url = server_url;
     shared.verbose = verbose;
-    shared.best_score = initial_target;
+    shared.fixed_threshold = fixed_threshold;  // Never changes - collects all >= target
+    shared.best_score = UINT64_MAX;            // For tracking best found
     shared.start_time = std::chrono::steady_clock::now();
 
-    std::cout << "Neural Proof-of-Work Miner (OpenCL)" << std::endl;
+    std::cout << "Neural Proof-of-Work Miner (OpenCL) - COLLECT ALL MODE" << std::endl;
     std::cout << "Username: " << shared.username << std::endl;
-    std::cout << "Target: " << target_zero_bits << "+ leading zero bits" << std::endl;
+    std::cout << "Collecting ALL nonces with " << target_zero_bits << "+ leading zero bits" << std::endl;
+    std::cout << "Server: " << server_url << std::endl;
     std::cout << "Network: " << INPUT_DIM << " -> " << HIDDEN_DIM << " -> " << HIDDEN_DIM << " -> " << HIDDEN_DIM << " -> " << OUTPUT_DIM << std::endl;
     std::cout << "Found " << devices.size() << " GPU(s)" << std::endl;
 
@@ -528,6 +640,9 @@ int main(int argc, char* argv[]) {
     }
 
     std::cout << "\nMining started...\n" << std::endl;
+
+    // Start submission worker thread
+    std::thread submit_thread(submit_worker_thread, std::ref(shared));
 
     std::vector<std::thread> worker_threads;
     for (auto& gpu : gpus) {
@@ -583,21 +698,32 @@ int main(int argc, char* argv[]) {
                       << (smoothed_rate / 1e6) << " M/s"
                       << " | " << std::setprecision(3) << (total_evals / 1e9) << "B total"
                       << " | best=" << current_bits << " bits"
-                      << " | " << total_matches << " hits"
+                      << " | " << total_matches << " found"
+                      << " | " << shared.accepted.load() << "/" << shared.submitted.load() << " accepted"
                       << " | " << elapsed_total << "s"
                       << "        " << std::flush;
         }
     }
 
+    // Notify submit thread to finish
+    shared.submit_cv.notify_all();
+
     for (auto& t : worker_threads) {
         t.join();
     }
+
+    submit_thread.join();
 
     // Final results
     std::cout << "\n\n========================================" << std::endl;
     std::cout << "Final Results" << std::endl;
     std::cout << "========================================" << std::endl;
     std::cout << "Username: " << shared.username << std::endl;
+
+    std::cout << "\nSubmissions:" << std::endl;
+    std::cout << "  Submitted: " << shared.submitted.load() << std::endl;
+    std::cout << "  Accepted:  " << shared.accepted.load() << std::endl;
+    std::cout << "  Rejected:  " << shared.rejected.load() << std::endl;
 
     if (!shared.best_nonce.empty()) {
         std::string digest_hex = bytes_to_hex(shared.best_digest.data(), shared.best_digest.size());

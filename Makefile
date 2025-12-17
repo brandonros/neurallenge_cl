@@ -63,7 +63,7 @@ $(MINER): $(OUTDIR)/miner.o
 	$(CC) $< $(LDFLAGS) -o $@
 
 $(OUTDIR)/miner.o: src/miner.cpp src/config.h $(OUTDIR)/kernel_embedded.h | $(OUTDIR)
-	$(CC) $(CFLAGS) $(CDEFINES) -I$(OUTDIR) -Isrc $< -o $@
+	$(CC) $(CFLAGS) $(CDEFINES) -I$(OUTDIR) -Isrc -Ivendor $< -o $@
 
 # Server (HTTP + OpenCL verifier + SQLite)
 $(SERVER): $(OUTDIR)/server.o
