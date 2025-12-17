@@ -29,5 +29,6 @@ make clean
 make server
 
 # run server
+tmux kill-session -t neurallenge 2>/dev/null
 tmux new-session -d -s neurallenge './output/server'
 EOF
