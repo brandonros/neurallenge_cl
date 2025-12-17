@@ -16,12 +16,12 @@ ssh -p $SSH_PORT $SSH_USERNAME@$SSH_HOST << EOF
 killall miner
 
 # install dependencies
-apt install -y xxd opencl-headers ocl-icd-opencl-dev pocl-opencl-icd libsqlite3-dev
+apt install -y xxd
 
 # build project
 cd /workspace/neurallenge_cl
 make clean
-make GLOBAL_SIZE=131072 LOCAL_SIZE=128 HASHES_PER_THREAD=128
+make miner GLOBAL_SIZE=131072 LOCAL_SIZE=128 HASHES_PER_THREAD=128
 
 # run
 ./output/miner

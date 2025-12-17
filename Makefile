@@ -8,7 +8,7 @@ CC=g++
 # HASHES_PER_THREAD: Nonces evaluated per work-item
 #   - Higher = better weight cache reuse, fewer kernel launches
 #   - Too high = longer kernel time, less responsive target updates
-DEFAULT_USERNAME ?= brandonros
+DEFAULT_USERNAME ?= anonymous
 GLOBAL_SIZE ?= 8192
 LOCAL_SIZE ?= 64
 HASHES_PER_THREAD ?= 64

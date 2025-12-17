@@ -29,7 +29,7 @@ Like Shallenge, but with a neural network in the middle:
 
 ```bash
 make
-./output/miner -u brandonros -b 24
+./output/miner -u anonymous -b 24
 ```
 
 ## Usage
@@ -52,7 +52,7 @@ curl --request POST \
   --url http://localhost:8080/submit \
   --header 'content-type: application/json' \
   --data '{
-  "wallet": "brandonros",
+  "wallet": "anonymous",
   "nonce": "acga3kwyG+qhHDFJ"
 }'
 ```

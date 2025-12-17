@@ -9,7 +9,7 @@
             ],
             "defines": [
                 "CL_TARGET_OPENCL_VERSION=300",
-                "DEFAULT_USERNAME=\"brandonros\"",
+                "DEFAULT_USERNAME=\"anonymous\"",
                 "GLOBAL_SIZE=1048576",
                 "LOCAL_SIZE=256",
                 "HASHES_PER_THREAD=64"
