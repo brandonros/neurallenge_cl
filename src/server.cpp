@@ -434,15 +434,18 @@ int64_t get_proof_count(sqlite3* db) {
     return count;
 }
 
-json get_all_proofs_sorted(sqlite3* db) {
+json get_proofs_paginated(sqlite3* db, int limit, int offset) {
     json arr = json::array();
 
     sqlite3_stmt* stmt;
-    const char* sql = "SELECT timestamp, wallet, nonce, bits, reward, digest FROM proofs ORDER BY bits DESC";
+    const char* sql = "SELECT timestamp, wallet, nonce, bits, reward, digest FROM proofs ORDER BY bits DESC LIMIT ? OFFSET ?";
 
     if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
         return arr;
     }
+
+    sqlite3_bind_int(stmt, 1, limit);
+    sqlite3_bind_int(stmt, 2, offset);
 
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         json proof;
@@ -535,11 +538,25 @@ int main(int argc, char* argv[]) {
         res.set_content(j.dump(), "application/json");
     });
 
-    // Proofs (sorted by bits descending)
-    svr.Get("/proofs", [&state](const httplib::Request&, httplib::Response& res) {
+    // Proofs (sorted by bits descending, paginated)
+    svr.Get("/proofs", [&state](const httplib::Request& req, httplib::Response& res) {
+        int limit = 100;
+        int offset = 0;
+
+        if (req.has_param("limit")) {
+            limit = std::max(1, std::min(1000, std::atoi(req.get_param_value("limit").c_str())));
+        }
+        if (req.has_param("offset")) {
+            offset = std::max(0, std::atoi(req.get_param_value("offset").c_str()));
+        }
+
         std::lock_guard<std::mutex> lock(state.mutex);
-        json arr = get_all_proofs_sorted(state.db);
-        res.set_content(arr.dump(), "application/json");
+        json response;
+        response["total"] = get_proof_count(state.db);
+        response["limit"] = limit;
+        response["offset"] = offset;
+        response["proofs"] = get_proofs_paginated(state.db, limit, offset);
+        res.set_content(response.dump(), "application/json");
     });
 
     // Submit proof
@@ -632,7 +649,7 @@ int main(int argc, char* argv[]) {
     std::cout << "Endpoints:" << std::endl;
     std::cout << "  GET  /health - Health check" << std::endl;
     std::cout << "  GET  /stats  - Server statistics" << std::endl;
-    std::cout << "  GET  /proofs - All proofs (sorted by bits)" << std::endl;
+    std::cout << "  GET  /proofs - Proofs (sorted by bits, ?limit=100&offset=0)" << std::endl;
     std::cout << "  POST /submit - Submit proof {wallet, nonce}" << std::endl;
     std::cout << "Press Ctrl+C to stop." << std::endl;
 
