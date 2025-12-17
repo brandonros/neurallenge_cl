@@ -138,7 +138,6 @@ using json = nlohmann::json;
 constexpr int MIN_BITS = 20;
 constexpr int SERVER_PORT = 8080;
 constexpr const char* DB_FILE = "proofs.db";
-constexpr const char* WEIGHT_EPOCH = "epoch0";
 
 // ============================================================================
 // Utility Functions
@@ -181,8 +180,6 @@ struct OpenCLContext {
     cl_command_queue queue;
     cl_program program;
     cl_kernel verify_kernel;
-    cl_mem weights_buf;
-    std::vector<int8_t> weights;
 };
 
 bool init_opencl(OpenCLContext& cl) {
@@ -243,16 +240,22 @@ bool init_opencl(OpenCLContext& cl) {
     return true;
 }
 
-bool generate_weights_gpu(OpenCLContext& cl) {
+struct VerifyResult {
+    uint64_t score;
+    std::vector<uint8_t> digest;
+    int bits;
+};
+
+bool verify_nonce_gpu(OpenCLContext& cl, const std::string& epoch, const std::string& wallet, const std::vector<uint8_t>& nonce, VerifyResult& result) {
     cl_int err;
 
+    // Generate weights for this epoch
     cl_kernel gen_kernel = clCreateKernel(cl.program, "generate_weights_kernel", &err);
     if (err != CL_SUCCESS) return false;
 
-    std::string epoch = WEIGHT_EPOCH;
     cl_mem epoch_buf = clCreateBuffer(cl.context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
                                        epoch.size(), (void*)epoch.data(), &err);
-    cl_mem weights_buf = clCreateBuffer(cl.context, CL_MEM_WRITE_ONLY, TOTAL_WEIGHTS, nullptr, &err);
+    cl_mem weights_buf = clCreateBuffer(cl.context, CL_MEM_READ_WRITE, TOTAL_WEIGHTS, nullptr, &err);
     if (err != CL_SUCCESS) {
         clReleaseKernel(gen_kernel);
         return false;
@@ -263,51 +266,32 @@ bool generate_weights_gpu(OpenCLContext& cl) {
     clSetKernelArg(gen_kernel, 1, sizeof(cl_uint), &epoch_len);
     clSetKernelArg(gen_kernel, 2, sizeof(cl_mem), &weights_buf);
 
-    size_t global_size = (TOTAL_WEIGHTS + 31) / 32;
-    err = clEnqueueNDRangeKernel(cl.queue, gen_kernel, 1, nullptr, &global_size, nullptr, 0, nullptr, nullptr);
+    size_t gen_global_size = (TOTAL_WEIGHTS + 31) / 32;
+    err = clEnqueueNDRangeKernel(cl.queue, gen_kernel, 1, nullptr, &gen_global_size, nullptr, 0, nullptr, nullptr);
+    clReleaseKernel(gen_kernel);
+    clReleaseMemObject(epoch_buf);
+
     if (err != CL_SUCCESS) {
-        clReleaseMemObject(epoch_buf);
         clReleaseMemObject(weights_buf);
-        clReleaseKernel(gen_kernel);
         return false;
     }
 
-    cl.weights.resize(TOTAL_WEIGHTS);
-    err = clEnqueueReadBuffer(cl.queue, weights_buf, CL_TRUE, 0, TOTAL_WEIGHTS, cl.weights.data(), 0, nullptr, nullptr);
-
-    clReleaseMemObject(epoch_buf);
-    clReleaseMemObject(weights_buf);
-    clReleaseKernel(gen_kernel);
-
-    if (err != CL_SUCCESS) return false;
-
-    // Create persistent weights buffer for verification
-    cl.weights_buf = clCreateBuffer(cl.context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-                                     cl.weights.size(), cl.weights.data(), &err);
-    return err == CL_SUCCESS;
-}
-
-struct VerifyResult {
-    uint64_t score;
-    std::vector<uint8_t> digest;
-    int bits;
-};
-
-bool verify_nonce_gpu(OpenCLContext& cl, const std::string& wallet, const std::vector<uint8_t>& nonce, VerifyResult& result) {
-    cl_int err;
-
+    // Verify with generated weights
     cl_mem wallet_buf = clCreateBuffer(cl.context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
                                         wallet.size(), (void*)wallet.data(), &err);
     cl_mem nonce_buf = clCreateBuffer(cl.context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
                                        nonce.size(), (void*)nonce.data(), &err);
     cl_mem score_buf = clCreateBuffer(cl.context, CL_MEM_WRITE_ONLY, sizeof(cl_ulong), nullptr, &err);
     cl_mem digest_buf = clCreateBuffer(cl.context, CL_MEM_WRITE_ONLY, DIGEST_BYTES, nullptr, &err);
-    if (err != CL_SUCCESS) return false;
+    if (err != CL_SUCCESS) {
+        clReleaseMemObject(weights_buf);
+        return false;
+    }
 
     // Set args: weights, wallet, wallet_len, nonce, nonce_len, score, digest
     cl_uint wallet_len = static_cast<cl_uint>(wallet.size());
     cl_uint nonce_len = static_cast<cl_uint>(nonce.size());
-    clSetKernelArg(cl.verify_kernel, 0, sizeof(cl_mem), &cl.weights_buf);
+    clSetKernelArg(cl.verify_kernel, 0, sizeof(cl_mem), &weights_buf);
     clSetKernelArg(cl.verify_kernel, 1, sizeof(cl_mem), &wallet_buf);
     clSetKernelArg(cl.verify_kernel, 2, sizeof(cl_uint), &wallet_len);
     clSetKernelArg(cl.verify_kernel, 3, sizeof(cl_mem), &nonce_buf);
@@ -318,6 +302,7 @@ bool verify_nonce_gpu(OpenCLContext& cl, const std::string& wallet, const std::v
     size_t global_size = 1;
     err = clEnqueueNDRangeKernel(cl.queue, cl.verify_kernel, 1, nullptr, &global_size, nullptr, 0, nullptr, nullptr);
     if (err != CL_SUCCESS) {
+        clReleaseMemObject(weights_buf);
         clReleaseMemObject(wallet_buf);
         clReleaseMemObject(nonce_buf);
         clReleaseMemObject(score_buf);
@@ -330,6 +315,7 @@ bool verify_nonce_gpu(OpenCLContext& cl, const std::string& wallet, const std::v
     clEnqueueReadBuffer(cl.queue, digest_buf, CL_TRUE, 0, DIGEST_BYTES, result.digest.data(), 0, nullptr, nullptr);
     result.bits = count_leading_zero_bits(result.digest.data(), DIGEST_BYTES);
 
+    clReleaseMemObject(weights_buf);
     clReleaseMemObject(wallet_buf);
     clReleaseMemObject(nonce_buf);
     clReleaseMemObject(score_buf);
@@ -344,6 +330,7 @@ bool verify_nonce_gpu(OpenCLContext& cl, const std::string& wallet, const std::v
 
 struct ProofRecord {
     int64_t timestamp;
+    std::string epoch;
     std::string wallet;
     std::string nonce;
     int bits;
@@ -367,6 +354,7 @@ bool init_database(sqlite3* db) {
         CREATE TABLE IF NOT EXISTS proofs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             timestamp INTEGER NOT NULL,
+            epoch TEXT NOT NULL,
             wallet TEXT NOT NULL,
             nonce TEXT UNIQUE NOT NULL,
             bits INTEGER NOT NULL,
@@ -376,6 +364,7 @@ bool init_database(sqlite3* db) {
         CREATE INDEX IF NOT EXISTS idx_proofs_wallet ON proofs(wallet);
         CREATE INDEX IF NOT EXISTS idx_proofs_bits ON proofs(bits DESC);
         CREATE INDEX IF NOT EXISTS idx_proofs_nonce ON proofs(nonce);
+        CREATE INDEX IF NOT EXISTS idx_proofs_epoch ON proofs(epoch);
     )";
 
     char* err_msg = nullptr;
@@ -389,18 +378,19 @@ bool init_database(sqlite3* db) {
 
 bool insert_proof(sqlite3* db, const ProofRecord& proof) {
     sqlite3_stmt* stmt;
-    const char* sql = "INSERT INTO proofs (timestamp, wallet, nonce, bits, reward, digest) VALUES (?, ?, ?, ?, ?, ?)";
+    const char* sql = "INSERT INTO proofs (timestamp, epoch, wallet, nonce, bits, reward, digest) VALUES (?, ?, ?, ?, ?, ?, ?)";
 
     if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
         return false;
     }
 
     sqlite3_bind_int64(stmt, 1, proof.timestamp);
-    sqlite3_bind_text(stmt, 2, proof.wallet.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 3, proof.nonce.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int(stmt, 4, proof.bits);
-    sqlite3_bind_double(stmt, 5, proof.reward);
-    sqlite3_bind_text(stmt, 6, proof.digest.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, proof.epoch.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, proof.wallet.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 4, proof.nonce.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 5, proof.bits);
+    sqlite3_bind_double(stmt, 6, proof.reward);
+    sqlite3_bind_text(stmt, 7, proof.digest.c_str(), -1, SQLITE_TRANSIENT);
 
     bool success = (sqlite3_step(stmt) == SQLITE_DONE);
     sqlite3_finalize(stmt);
@@ -438,7 +428,7 @@ json get_proofs_paginated(sqlite3* db, int limit, int offset) {
     json arr = json::array();
 
     sqlite3_stmt* stmt;
-    const char* sql = "SELECT timestamp, wallet, nonce, bits, reward, digest FROM proofs ORDER BY digest ASC LIMIT ? OFFSET ?";
+    const char* sql = "SELECT timestamp, epoch, wallet, nonce, bits, reward, digest FROM proofs ORDER BY digest ASC LIMIT ? OFFSET ?";
 
     if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
         return arr;
@@ -450,11 +440,12 @@ json get_proofs_paginated(sqlite3* db, int limit, int offset) {
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         json proof;
         proof["timestamp"] = sqlite3_column_int64(stmt, 0);
-        proof["wallet"] = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
-        proof["nonce"] = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
-        proof["bits"] = sqlite3_column_int(stmt, 3);
-        proof["reward"] = sqlite3_column_double(stmt, 4);
-        proof["digest"] = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 5));
+        proof["epoch"] = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+        proof["wallet"] = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
+        proof["nonce"] = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3));
+        proof["bits"] = sqlite3_column_int(stmt, 4);
+        proof["reward"] = sqlite3_column_double(stmt, 5);
+        proof["digest"] = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 6));
         arr.push_back(proof);
     }
 
@@ -494,13 +485,6 @@ int main(int argc, char* argv[]) {
         std::cerr << "Failed to initialize OpenCL" << std::endl;
         return 1;
     }
-
-    std::cout << "Generating weights on GPU from epoch: " << WEIGHT_EPOCH << std::endl;
-    if (!generate_weights_gpu(state.cl)) {
-        std::cerr << "Failed to generate weights" << std::endl;
-        return 1;
-    }
-    std::cout << "Generated " << state.cl.weights.size() << " weight bytes" << std::endl;
 
     // Initialize SQLite database
     std::cout << "Opening database: " << DB_FILE << std::endl;
@@ -566,13 +550,14 @@ int main(int argc, char* argv[]) {
         try {
             json body = json::parse(req.body);
 
-            if (!body.contains("wallet") || !body.contains("nonce")) {
-                response["error"] = "missing wallet or nonce";
+            if (!body.contains("wallet") || !body.contains("nonce") || !body.contains("epoch")) {
+                response["error"] = "missing wallet, nonce, or epoch";
                 res.status = 400;
                 res.set_content(response.dump(), "application/json");
                 return;
             }
 
+            std::string epoch = body["epoch"];
             std::string wallet = body["wallet"];
             std::string nonce_str = body["nonce"];
             std::vector<uint8_t> nonce(nonce_str.begin(), nonce_str.end());
@@ -591,7 +576,7 @@ int main(int argc, char* argv[]) {
 
             // Verify proof on GPU
             VerifyResult vr;
-            if (!verify_nonce_gpu(state.cl, wallet, nonce, vr)) {
+            if (!verify_nonce_gpu(state.cl, epoch, wallet, nonce, vr)) {
                 response["error"] = "verification failed";
                 state.total_rejected++;
                 res.status = 500;
@@ -613,6 +598,7 @@ int main(int argc, char* argv[]) {
             auto now = std::chrono::system_clock::now();
             ProofRecord proof = {
                 std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count(),
+                epoch,
                 wallet,
                 nonce_str,
                 vr.bits,
@@ -629,7 +615,7 @@ int main(int argc, char* argv[]) {
                 return;
             }
 
-            std::cout << "[Proof] " << proof.bits << " bits | wallet=" << proof.wallet << " | reward=" << proof.reward << std::endl;
+            std::cout << "[Proof] " << proof.bits << " bits | epoch=" << proof.epoch << " | wallet=" << proof.wallet << " | reward=" << proof.reward << std::endl;
 
             response["success"] = true;
             response["bits"] = proof.bits;
@@ -650,7 +636,7 @@ int main(int argc, char* argv[]) {
     std::cout << "  GET  /health - Health check" << std::endl;
     std::cout << "  GET  /stats  - Server statistics" << std::endl;
     std::cout << "  GET  /proofs - Proofs (sorted by bits, ?limit=100&offset=0)" << std::endl;
-    std::cout << "  POST /submit - Submit proof {wallet, nonce}" << std::endl;
+    std::cout << "  POST /submit - Submit proof {epoch, wallet, nonce}" << std::endl;
     std::cout << "Press Ctrl+C to stop." << std::endl;
 
     g_server = &svr;

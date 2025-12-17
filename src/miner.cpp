@@ -40,7 +40,7 @@ using json = nlohmann::json;
 #define STRINGIFY_(x) #x
 #define STRINGIFY(x) STRINGIFY_(x)
 
-constexpr const char* WEIGHT_EPOCH = "epoch0";
+constexpr const char* DEFAULT_EPOCH = "epoch0";
 
 // ============================================================================
 // Utility Functions
@@ -105,6 +105,7 @@ struct SharedState {
 
     // Submission queue
     std::string server_url;
+    std::string epoch;
     std::mutex submit_mutex;
     std::condition_variable submit_cv;
     std::queue<SubmitEntry> submit_queue;
@@ -404,6 +405,7 @@ void submit_worker_thread(SharedState& shared) {
         json payload;
         payload["wallet"] = entry.wallet;
         payload["nonce"] = entry.nonce;
+        payload["epoch"] = shared.epoch;
 
         shared.submitted.fetch_add(1);
 
@@ -440,6 +442,7 @@ void submit_worker_thread(SharedState& shared) {
         json payload;
         payload["wallet"] = entry.wallet;
         payload["nonce"] = entry.nonce;
+        payload["epoch"] = shared.epoch;
 
         auto res = cli.Post("/submit", payload.dump(), "application/json");
         if (res && res->status == 200) {
@@ -531,6 +534,7 @@ void signal_handler(int) {
 int main(int argc, char* argv[]) {
     std::string username = DEFAULT_USERNAME;
     std::string server_url = "http://localhost:8080";
+    std::string epoch = DEFAULT_EPOCH;
     int target_zero_bits = 16;
     bool verbose = false;
 
@@ -543,6 +547,7 @@ int main(int argc, char* argv[]) {
                       << "Options:\n"
                       << "  -u, --user STRING   Username (default: " << DEFAULT_USERNAME << ")\n"
                       << "  -s, --server URL    Server URL for proof submission (default: http://localhost:8080)\n"
+                      << "  -e, --epoch STRING  Weight epoch (default: " << DEFAULT_EPOCH << ")\n"
                       << "  -b, --bits N        Target leading zero bits (default: 16)\n"
                       << "  -x, --hex N         Target leading zero hex digits (N*4 bits)\n"
                       << "  -v, --verbose       Show network outputs\n"
@@ -556,6 +561,10 @@ int main(int argc, char* argv[]) {
             server_url = argv[++i];
         } else if (arg.rfind("--server=", 0) == 0) {
             server_url = arg.substr(9);
+        } else if ((arg == "--epoch" || arg == "-e") && i + 1 < argc) {
+            epoch = argv[++i];
+        } else if (arg.rfind("--epoch=", 0) == 0) {
+            epoch = arg.substr(8);
         } else if ((arg == "--bits" || arg == "-b") && i + 1 < argc) {
             target_zero_bits = std::max(std::stoi(argv[++i]), 1);
         } else if (arg.rfind("--bits=", 0) == 0) {
@@ -588,9 +597,9 @@ int main(int argc, char* argv[]) {
     }
 
     // Generate weights on GPU
-    std::cout << "Generating weights on GPU from epoch: " << WEIGHT_EPOCH << std::endl;
+    std::cout << "Generating weights on GPU from epoch: " << epoch << std::endl;
     std::vector<int8_t> weights;
-    if (!generate_weights_gpu(*gpus[0], WEIGHT_EPOCH, weights)) {
+    if (!generate_weights_gpu(*gpus[0], epoch.c_str(), weights)) {
         std::cerr << "Failed to generate weights" << std::endl;
         return 1;
     }
@@ -605,6 +614,7 @@ int main(int argc, char* argv[]) {
     SharedState shared;
     shared.username = username;
     shared.server_url = server_url;
+    shared.epoch = epoch;
     shared.verbose = verbose;
     shared.fixed_threshold = fixed_threshold;  // Never changes - collects all >= target
     shared.best_score = UINT64_MAX;            // For tracking best found
@@ -612,6 +622,7 @@ int main(int argc, char* argv[]) {
 
     std::cout << "Neural Proof-of-Work Miner (OpenCL) - COLLECT ALL MODE" << std::endl;
     std::cout << "Username: " << shared.username << std::endl;
+    std::cout << "Epoch: " << epoch << std::endl;
     std::cout << "Collecting ALL nonces with " << target_zero_bits << "+ leading zero bits" << std::endl;
     std::cout << "Server: " << server_url << std::endl;
     std::cout << "Network: " << INPUT_DIM << " -> " << HIDDEN_DIM << " -> " << HIDDEN_DIM << " -> " << HIDDEN_DIM << " -> " << OUTPUT_DIM << std::endl;
