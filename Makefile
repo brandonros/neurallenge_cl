@@ -25,8 +25,10 @@ OUTDIR=output
 UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Darwin)
     LDFLAGS=-framework OpenCL -pthread
+    LDFLAGS_SERVER=-framework OpenCL -lsqlite3 -pthread
 else
     LDFLAGS=-lOpenCL -pthread
+    LDFLAGS_SERVER=-lOpenCL -lsqlite3 -pthread
 endif
 
 # Host compiler flags:
@@ -63,9 +65,9 @@ $(MINER): $(OUTDIR)/miner.o
 $(OUTDIR)/miner.o: src/miner.cpp src/config.h $(OUTDIR)/kernel_embedded.h | $(OUTDIR)
 	$(CC) $(CFLAGS) $(CDEFINES) -I$(OUTDIR) -Isrc $< -o $@
 
-# Server (HTTP + OpenCL verifier)
+# Server (HTTP + OpenCL verifier + SQLite)
 $(SERVER): $(OUTDIR)/server.o
-	$(CC) $< $(LDFLAGS) -o $@
+	$(CC) $< $(LDFLAGS_SERVER) -o $@
 
 $(OUTDIR)/server.o: src/server.cpp src/config.h $(OUTDIR)/kernel_embedded.h | $(OUTDIR)
 	$(CC) $(CFLAGS) $(CDEFINES) -I$(OUTDIR) -Isrc -Ivendor $< -o $@

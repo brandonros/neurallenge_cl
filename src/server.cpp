@@ -11,14 +11,14 @@
 #include <chrono>
 #include <csignal>
 #include <cstdint>
-#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <mutex>
 #include <sstream>
 #include <string>
-#include <unordered_set>
 #include <vector>
+
+#include <sqlite3.h>
 
 #include "httplib.h"
 #include "json.hpp"
@@ -137,7 +137,7 @@ using json = nlohmann::json;
 
 constexpr int MIN_BITS = 32;
 constexpr int SERVER_PORT = 8080;
-constexpr const char* PROOFS_FILE = "proofs.jsonl";
+constexpr const char* DB_FILE = "proofs.db";
 constexpr const char* WEIGHT_EPOCH = "epoch0";
 
 // ============================================================================
@@ -349,38 +349,115 @@ struct ProofRecord {
     int bits;
     double reward;
     std::string digest;
-
-    json to_json() const {
-        return {
-            {"timestamp", timestamp},
-            {"wallet", wallet},
-            {"nonce", nonce},
-            {"bits", bits},
-            {"reward", reward},
-            {"digest", digest}
-        };
-    }
-
-    static ProofRecord from_json(const json& j) {
-        return {
-            j["timestamp"].get<int64_t>(),
-            j["wallet"].get<std::string>(),
-            j["nonce"].get<std::string>(),
-            j["bits"].get<int>(),
-            j["reward"].get<double>(),
-            j["digest"].get<std::string>()
-        };
-    }
 };
 
 struct ServerState {
     OpenCLContext cl;
-    std::unordered_set<std::string> seen_nonces;  // O(1) duplicate check (derived from proofs)
-    std::vector<ProofRecord> proofs;
+    sqlite3* db = nullptr;
     std::mutex mutex;
-    std::ofstream proof_log;
-    uint64_t total_rejected = 0;
+    uint64_t total_rejected = 0;  // In-memory counter (not persisted)
 };
+
+// ============================================================================
+// SQLite Database
+// ============================================================================
+
+bool init_database(sqlite3* db) {
+    const char* schema = R"(
+        CREATE TABLE IF NOT EXISTS proofs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp INTEGER NOT NULL,
+            wallet TEXT NOT NULL,
+            nonce TEXT UNIQUE NOT NULL,
+            bits INTEGER NOT NULL,
+            reward REAL NOT NULL,
+            digest TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_proofs_wallet ON proofs(wallet);
+        CREATE INDEX IF NOT EXISTS idx_proofs_bits ON proofs(bits DESC);
+        CREATE INDEX IF NOT EXISTS idx_proofs_nonce ON proofs(nonce);
+    )";
+
+    char* err_msg = nullptr;
+    if (sqlite3_exec(db, schema, nullptr, nullptr, &err_msg) != SQLITE_OK) {
+        std::cerr << "Failed to create schema: " << err_msg << std::endl;
+        sqlite3_free(err_msg);
+        return false;
+    }
+    return true;
+}
+
+bool insert_proof(sqlite3* db, const ProofRecord& proof) {
+    sqlite3_stmt* stmt;
+    const char* sql = "INSERT INTO proofs (timestamp, wallet, nonce, bits, reward, digest) VALUES (?, ?, ?, ?, ?, ?)";
+
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        return false;
+    }
+
+    sqlite3_bind_int64(stmt, 1, proof.timestamp);
+    sqlite3_bind_text(stmt, 2, proof.wallet.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, proof.nonce.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 4, proof.bits);
+    sqlite3_bind_double(stmt, 5, proof.reward);
+    sqlite3_bind_text(stmt, 6, proof.digest.c_str(), -1, SQLITE_TRANSIENT);
+
+    bool success = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    return success;
+}
+
+bool nonce_exists(sqlite3* db, const std::string& nonce) {
+    sqlite3_stmt* stmt;
+    const char* sql = "SELECT 1 FROM proofs WHERE nonce = ? LIMIT 1";
+
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        return true;  // Fail safe: assume exists on error
+    }
+
+    sqlite3_bind_text(stmt, 1, nonce.c_str(), -1, SQLITE_TRANSIENT);
+    bool exists = (sqlite3_step(stmt) == SQLITE_ROW);
+    sqlite3_finalize(stmt);
+    return exists;
+}
+
+int64_t get_proof_count(sqlite3* db) {
+    sqlite3_stmt* stmt;
+    if (sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM proofs", -1, &stmt, nullptr) != SQLITE_OK) {
+        return 0;
+    }
+    int64_t count = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        count = sqlite3_column_int64(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+    return count;
+}
+
+json get_all_proofs_sorted(sqlite3* db) {
+    json arr = json::array();
+
+    sqlite3_stmt* stmt;
+    const char* sql = "SELECT timestamp, wallet, nonce, bits, reward, digest FROM proofs ORDER BY bits DESC";
+
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        return arr;
+    }
+
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        json proof;
+        proof["timestamp"] = sqlite3_column_int64(stmt, 0);
+        proof["wallet"] = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+        proof["nonce"] = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
+        proof["bits"] = sqlite3_column_int(stmt, 3);
+        proof["reward"] = sqlite3_column_double(stmt, 4);
+        proof["digest"] = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 5));
+        arr.push_back(proof);
+    }
+
+    sqlite3_finalize(stmt);
+    return arr;
+}
 
 // ============================================================================
 // Signal Handling
@@ -422,30 +499,24 @@ int main(int argc, char* argv[]) {
     }
     std::cout << "Generated " << state.cl.weights.size() << " weight bytes" << std::endl;
 
-    // Load existing proofs from file
-    {
-        std::ifstream in(PROOFS_FILE);
-        if (in.is_open()) {
-            std::string line;
-            while (std::getline(in, line)) {
-                if (line.empty()) continue;
-                try {
-                    ProofRecord p = ProofRecord::from_json(json::parse(line));
-                    state.seen_nonces.insert(p.nonce);
-                    state.proofs.push_back(p);
-                } catch (...) {
-                    // Skip malformed lines
-                }
-            }
-            std::cout << "Loaded " << state.proofs.size() << " existing proofs from " << PROOFS_FILE << std::endl;
-        }
-    }
-
-    state.proof_log.open(PROOFS_FILE, std::ios::app);
-    if (!state.proof_log.is_open()) {
-        std::cerr << "Failed to open " << PROOFS_FILE << std::endl;
+    // Initialize SQLite database
+    std::cout << "Opening database: " << DB_FILE << std::endl;
+    if (sqlite3_open(DB_FILE, &state.db) != SQLITE_OK) {
+        std::cerr << "Failed to open database: " << sqlite3_errmsg(state.db) << std::endl;
         return 1;
     }
+
+    // Enable WAL mode for better concurrent read/write performance
+    sqlite3_exec(state.db, "PRAGMA journal_mode=WAL", nullptr, nullptr, nullptr);
+
+    if (!init_database(state.db)) {
+        std::cerr << "Failed to initialize database schema" << std::endl;
+        sqlite3_close(state.db);
+        return 1;
+    }
+
+    int64_t proof_count = get_proof_count(state.db);
+    std::cout << "Database contains " << proof_count << " proofs" << std::endl;
 
     httplib::Server svr;
 
@@ -458,7 +529,7 @@ int main(int argc, char* argv[]) {
     svr.Get("/stats", [&state](const httplib::Request&, httplib::Response& res) {
         std::lock_guard<std::mutex> lock(state.mutex);
         json j;
-        j["total_proofs"] = state.proofs.size();
+        j["total_proofs"] = get_proof_count(state.db);
         j["total_rejected"] = state.total_rejected;
         j["min_bits"] = MIN_BITS;
         res.set_content(j.dump(), "application/json");
@@ -467,17 +538,7 @@ int main(int argc, char* argv[]) {
     // Proofs (sorted by bits descending)
     svr.Get("/proofs", [&state](const httplib::Request&, httplib::Response& res) {
         std::lock_guard<std::mutex> lock(state.mutex);
-
-        // Copy and sort by bits descending
-        std::vector<ProofRecord> sorted = state.proofs;
-        std::sort(sorted.begin(), sorted.end(), [](const ProofRecord& a, const ProofRecord& b) {
-            return a.bits > b.bits;
-        });
-
-        json arr = json::array();
-        for (const auto& p : sorted) {
-            arr.push_back(p.to_json());
-        }
+        json arr = get_all_proofs_sorted(state.db);
         res.set_content(arr.dump(), "application/json");
     });
 
@@ -502,8 +563,8 @@ int main(int argc, char* argv[]) {
             // Hold lock for entire verification + storage to prevent TOCTOU race
             std::lock_guard<std::mutex> lock(state.mutex);
 
-            // Check for duplicate
-            if (state.seen_nonces.count(nonce_str)) {
+            // Check for duplicate (indexed lookup in SQLite)
+            if (nonce_exists(state.db, nonce_str)) {
                 response["error"] = "duplicate nonce";
                 state.total_rejected++;
                 res.status = 400;
@@ -542,10 +603,14 @@ int main(int argc, char* argv[]) {
                 bytes_to_hex(vr.digest.data(), DIGEST_BYTES)
             };
 
-            state.seen_nonces.insert(proof.nonce);
-            state.proofs.push_back(proof);
-            state.proof_log << proof.to_json().dump() << std::endl;
-            state.proof_log.flush();
+            if (!insert_proof(state.db, proof)) {
+                // UNIQUE constraint violation = duplicate nonce (race condition)
+                response["error"] = "duplicate nonce";
+                state.total_rejected++;
+                res.status = 400;
+                res.set_content(response.dump(), "application/json");
+                return;
+            }
 
             std::cout << "[Proof] " << proof.bits << " bits | wallet=" << proof.wallet << " | reward=" << proof.reward << std::endl;
 
@@ -574,7 +639,7 @@ int main(int argc, char* argv[]) {
     g_server = &svr;
     svr.listen("0.0.0.0", port);
 
-    state.proof_log.close();
+    sqlite3_close(state.db);
     std::cout << "\nServer stopped." << std::endl;
 
     return 0;
